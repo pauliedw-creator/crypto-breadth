@@ -57,8 +57,11 @@ const SECTOR_MAP = {
 const SECTOR_META = {
   L1:{color:P.green}, L2:{color:P.blue}, DeFi:{color:P.lavender},
   AI:{color:P.amber}, Meme:{color:P.red}, Gaming:{color:P.teal},
-  Other:{color:P.textMuted},
 };
+
+// Any coin not in SECTOR_MAP is classified as Meme (catch-all for the long tail of
+// low-cap speculative coins that dominate the uncategorised set)
+const getSector = sym => SECTOR_MAP[sym] || "Meme";
 
 const REGIME_META = {
   BULL:   {label:"Bull Market",  color:P.green,   bg:P.greenPale},
@@ -213,7 +216,7 @@ const computeBreadthFromBybit = (priceData, sectorFilter = null) => {
   const filteredIds = sectorFilter
     ? coinIds.filter(id => {
         const sym = priceData[id].symbol;
-        const sec = SECTOR_MAP[sym] || "Other";
+        const sec = getSector(sym);
         return sec === sectorFilter;
       })
     : coinIds;
@@ -306,7 +309,7 @@ const MetricCard = ({ label, value, sub, pct }) => {
 };
 
 const SectorRow = ({ name, pct, adv, total }) => {
-  const meta = SECTOR_META[name] || SECTOR_META.Other;
+  const meta = SECTOR_META[name] || SECTOR_META.Meme;
   const c = bc(pct);
   return (
     <div style={{ marginBottom:12 }}>
@@ -555,23 +558,29 @@ export default function App() {
     return withOverlay;
   }, [history, range]);
 
-  // Identify weekend ranges (Saturday/Sunday in UTC) for shading
+  // Identify weekend ranges (Saturday 00:00 UTC → Monday 00:00 UTC) for shading
   const weekendRanges = useMemo(() => {
     if (!showWeekends || !visibleHistory.length) return [];
+    const firstTs = visibleHistory[0].ts;
+    const lastTs  = visibleHistory[visibleHistory.length - 1].ts;
     const ranges = [];
-    let weekendStart = null;
-    for (let i = 0; i < visibleHistory.length; i++) {
-      const d = new Date(visibleHistory[i].ts);
-      const day = d.getUTCDay(); // 0 Sun, 6 Sat
-      const isWeekend = day === 0 || day === 6;
-      if (isWeekend && weekendStart == null) {
-        weekendStart = visibleHistory[i].dateLabel;
-      } else if (!isWeekend && weekendStart != null) {
-        ranges.push({ x1: weekendStart, x2: visibleHistory[i - 1].dateLabel });
-        weekendStart = null;
-      }
+
+    // Walk from the first visible point's week backwards to find the Saturday 00:00 UTC
+    // that starts the earliest weekend to render
+    const d0 = new Date(firstTs);
+    // Go back to the most recent Saturday at 00:00 UTC
+    const daysBack = (d0.getUTCDay() + 1) % 7; // Sat=6 → 0, Sun=0 → 1, Mon=1 → 2…
+    const firstSat = Date.UTC(d0.getUTCFullYear(), d0.getUTCMonth(), d0.getUTCDate() - daysBack, 0, 0, 0);
+
+    const WEEK = 7 * 24 * 60 * 60 * 1000;
+    const WEEKEND = 2 * 24 * 60 * 60 * 1000;
+    for (let sat = firstSat; sat <= lastTs + WEEK; sat += WEEK) {
+      const sun_end = sat + WEEKEND;
+      // Clip to visible window
+      const x1 = Math.max(sat, firstTs);
+      const x2 = Math.min(sun_end, lastTs);
+      if (x2 > x1) ranges.push({ x1, x2 });
     }
-    if (weekendStart != null) ranges.push({ x1: weekendStart, x2: visibleHistory[visibleHistory.length - 1].dateLabel });
     return ranges;
   }, [visibleHistory, showWeekends]);
 
@@ -589,7 +598,7 @@ export default function App() {
     const dec = coins.filter(c => (c[k24] ?? c.price_change_percentage_24h ?? 0) < 0).length;
     const secMap = {};
     coins.forEach(c => {
-      const s = SECTOR_MAP[c.symbol?.toUpperCase()] || "Other";
+      const s = getSector(c.symbol?.toUpperCase());
       if (!secMap[s]) secMap[s] = { adv:0, total:0 };
       secMap[s].total++;
       if ((c[k24] ?? c.price_change_percentage_24h ?? 0) > 0) secMap[s].adv++;
@@ -703,7 +712,7 @@ export default function App() {
               padding:"3px 10px", cursor:"pointer", fontSize:10,
               fontFamily:"DM Mono, monospace", borderRadius:4, transition:"all 0.15s",
             }}>All</button>
-            {Object.keys(SECTOR_META).filter(s => s !== "Other").map(sec => {
+            {Object.keys(SECTOR_META).map(sec => {
               const meta = SECTOR_META[sec];
               const active = sectorFilter === sec;
               return (
@@ -756,7 +765,20 @@ export default function App() {
                 </linearGradient>
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke={P.border2} vertical={false}/>
-              <XAxis dataKey="dateLabel" tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={50}/>
+              <XAxis
+                dataKey="ts"
+                type="number"
+                scale="time"
+                domain={["dataMin", "dataMax"]}
+                tick={{ fontSize:8, fill:P.textMuted }}
+                tickLine={false}
+                axisLine={false}
+                tickFormatter={ts => {
+                  const d = new Date(ts);
+                  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+                }}
+                minTickGap={50}
+              />
               <YAxis domain={[0,100]} tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} tickFormatter={v=>`${v}%`}/>
               <Tooltip content={<CustomTooltip/>}/>
 
@@ -789,7 +811,7 @@ export default function App() {
               {showExtremes && visibleHistory.filter(p => p.extreme).map((p, i) => (
                 <ReferenceDot
                   key={`ext-${i}`}
-                  x={p.dateLabel}
+                  x={p.ts}
                   y={p.mom24}
                   r={3}
                   fill={p.extreme === "high" ? P.green : P.red}
@@ -803,7 +825,7 @@ export default function App() {
               {showDivergence && visibleHistory.filter(p => p.divergence).map((p, i) => (
                 <ReferenceDot
                   key={`div-${i}`}
-                  x={p.dateLabel}
+                  x={p.ts}
                   y={p.mom24}
                   r={5}
                   fill={p.divergence === "bearish" ? P.red : P.green}
