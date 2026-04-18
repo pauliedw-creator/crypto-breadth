@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
-  AreaChart, Area, ComposedChart, XAxis, YAxis, CartesianGrid,
+  AreaChart, Area, ComposedChart, BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, ReferenceLine,
   ReferenceArea, ReferenceDot, Line,
 } from "recharts";
@@ -397,6 +397,7 @@ export default function App() {
   const [showETH, setShowETH]           = useState(false);
   const [showDivergence, setShowDivergence] = useState(false);
   const [showExtremes, setShowExtremes] = useState(false);
+  const [showMomentum, setShowMomentum] = useState(true);
   const bootRan = useRef(false);
 
   useEffect(() => {
@@ -555,6 +556,18 @@ export default function App() {
       else if (priceDelta < -10 && breadthDelta > 12) cur.divergence = "bullish";
     }
 
+    // Compute breadth ROC (rate of change) — 6h and 24h lookback
+    // This is "breadth of breadth" — tells you if breadth itself is accelerating
+    for (let i = 0; i < withOverlay.length; i++) {
+      const cur = withOverlay[i];
+      // 6h ROC
+      const past6 = withOverlay[Math.max(0, i - 6)];
+      cur.roc6h = (cur.mom24 != null && past6?.mom24 != null) ? cur.mom24 - past6.mom24 : null;
+      // 24h ROC
+      const past24 = withOverlay[Math.max(0, i - 24)];
+      cur.roc24h = (cur.mom24 != null && past24?.mom24 != null) ? cur.mom24 - past24.mom24 : null;
+    }
+
     return withOverlay;
   }, [history, range]);
 
@@ -583,6 +596,97 @@ export default function App() {
     }
     return ranges;
   }, [visibleHistory, showWeekends]);
+
+  // ── Trading context metrics ──
+  const context = useMemo(() => {
+    if (!history.length) return null;
+    const cur = history[history.length - 1];
+    if (!cur || cur.mom24 == null) return null;
+
+    // Multi-timeframe alignment (1h, 24h, 7d)
+    const mtf = {
+      h1:  cur.mom1h  ?? null,
+      h24: cur.mom24  ?? null,
+      d7:  cur.mom7d  ?? null,
+    };
+    const mtfStates = {
+      h1:  mtf.h1  == null ? "?" : mtf.h1  >= 55 ? "bull" : mtf.h1  <= 45 ? "bear" : "neutral",
+      h24: mtf.h24 == null ? "?" : mtf.h24 >= 55 ? "bull" : mtf.h24 <= 45 ? "bear" : "neutral",
+      d7:  mtf.d7  == null ? "?" : mtf.d7  >= 55 ? "bull" : mtf.d7  <= 45 ? "bear" : "neutral",
+    };
+    const bulls = [mtfStates.h1, mtfStates.h24, mtfStates.d7].filter(s => s === "bull").length;
+    const bears = [mtfStates.h1, mtfStates.h24, mtfStates.d7].filter(s => s === "bear").length;
+    const mtfVerdict =
+      bulls === 3 ? { label: "Full stack bull — strongest long signal", tone: "strong-bull" } :
+      bears === 3 ? { label: "Full stack bear — strongest short signal", tone: "strong-bear" } :
+      bulls === 2 ? { label: "Mostly bull — bias long", tone: "bull" } :
+      bears === 2 ? { label: "Mostly bear — bias short/flat", tone: "bear" } :
+                    { label: "Mixed signals — reduce size", tone: "neutral" };
+
+    // "Where am I now" — percentile in last 30d
+    const cutoff30d = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const recent = history.filter(p => p.ts >= cutoff30d && p.mom24 != null);
+    let percentile = null;
+    if (recent.length >= 20) {
+      const sorted = [...recent].map(p => p.mom24).sort((a, b) => a - b);
+      const below = sorted.filter(v => v < cur.mom24).length;
+      percentile = Math.round(below / sorted.length * 100);
+    }
+    const recent30 = recent.map(p => p.mom24);
+    const min30 = recent30.length ? Math.min(...recent30) : null;
+    const max30 = recent30.length ? Math.max(...recent30) : null;
+    const avg30 = recent30.length ? Math.round(recent30.reduce((s, v) => s + v, 0) / recent30.length) : null;
+
+    // BTC volatility regime from hourly price changes
+    let volRegime = null, volPct = null;
+    const btcPts = history.filter(p => p.btcPrice != null).slice(-168);
+    if (btcPts.length >= 48) {
+      const changes = [];
+      for (let i = 1; i < btcPts.length; i++) {
+        const delta = Math.abs(btcPts[i].btcPrice - btcPts[i - 1].btcPrice);
+        changes.push(delta / btcPts[i - 1].btcPrice);
+      }
+      const recent24 = changes.slice(-24);
+      const avgRecent = recent24.reduce((s, v) => s + v, 0) / recent24.length;
+      const avgBaseline = changes.reduce((s, v) => s + v, 0) / changes.length;
+      volPct = (avgRecent * 100).toFixed(2);
+      const ratio = avgRecent / avgBaseline;
+      volRegime =
+        ratio < 0.7  ? { label: "Low",      tone: "low",      advice: "Favourable · consider larger positions" } :
+        ratio < 1.3  ? { label: "Normal",   tone: "normal",   advice: "Standard position sizing" } :
+        ratio < 2.0  ? { label: "Elevated", tone: "elevated", advice: "Widen stops · reduce size 25%" } :
+                       { label: "Extreme",  tone: "extreme",  advice: "Halve size or stand aside" };
+    }
+
+    // Conditional stats: forward 24h BTC returns by current breadth regime
+    let condStats = null;
+    if (btcPts.length >= 100) {
+      const samples = { bull: [], neutral: [], bear: [] };
+      for (let i = 0; i < history.length - 24; i++) {
+        const p = history[i];
+        const f = history[i + 24];
+        if (p.mom24 == null || p.btcPrice == null || f.btcPrice == null) continue;
+        const ret = ((f.btcPrice - p.btcPrice) / p.btcPrice) * 100;
+        if (p.mom24 >= 60)      samples.bull.push(ret);
+        else if (p.mom24 <= 40) samples.bear.push(ret);
+        else                     samples.neutral.push(ret);
+      }
+      const avg = arr => arr.length ? arr.reduce((s,v)=>s+v,0) / arr.length : null;
+      condStats = {
+        bull:    { n: samples.bull.length,    avgRet: avg(samples.bull) },
+        neutral: { n: samples.neutral.length, avgRet: avg(samples.neutral) },
+        bear:    { n: samples.bear.length,    avgRet: avg(samples.bear) },
+      };
+    }
+
+    return {
+      current: cur.mom24,
+      mtf, mtfStates, mtfVerdict,
+      percentile, min30, max30, avg30,
+      volRegime, volPct,
+      condStats,
+    };
+  }, [history]);
 
   const m = useMemo(() => {
     if (!coins.length) return null;
@@ -684,6 +788,115 @@ export default function App() {
         </div>
       )}
 
+      {/* DECISION SUPPORT PANEL */}
+      {context && (
+        <div style={{ display:"flex", gap:8, marginBottom:14, flexWrap:"wrap" }}>
+          {/* Multi-timeframe alignment */}
+          <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:8, padding:"14px 18px", flex:"1 1 260px", minWidth:220 }}>
+            <div style={{ fontSize:9, letterSpacing:2, color:P.textMuted, textTransform:"uppercase", marginBottom:10, fontFamily:"DM Mono, monospace" }}>
+              Multi-timeframe alignment
+            </div>
+            <div style={{ display:"flex", gap:10, marginBottom:8 }}>
+              {[
+                { label:"1h",  state:context.mtfStates.h1,  val:context.mtf.h1 },
+                { label:"24h", state:context.mtfStates.h24, val:context.mtf.h24 },
+                { label:"7d",  state:context.mtfStates.d7,  val:context.mtf.d7 },
+              ].map(({ label, state, val }) => {
+                const col = state === "bull" ? P.green : state === "bear" ? P.red : P.amber;
+                return (
+                  <div key={label} style={{ flex:1, textAlign:"center", padding:"6px 4px", background:bbg(state==="bull"?70:state==="bear"?30:50), border:`1px solid ${col}40`, borderRadius:6 }}>
+                    <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>{label}</div>
+                    <div style={{ fontSize:14, fontWeight:600, color:col, fontFamily:"DM Mono, monospace" }}>{val ?? "—"}%</div>
+                    <div style={{ fontSize:8, color:col, fontFamily:"DM Mono, monospace", textTransform:"uppercase", marginTop:2 }}>
+                      {state === "bull" ? "▲ bull" : state === "bear" ? "▼ bear" : "• flat"}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{
+              fontSize:10, fontFamily:"DM Mono, monospace", padding:"5px 8px", borderRadius:4,
+              background: context.mtfVerdict.tone.includes("bull") ? P.greenPale :
+                          context.mtfVerdict.tone.includes("bear") ? P.redPale : P.amberPale,
+              color: context.mtfVerdict.tone.includes("bull") ? P.green :
+                     context.mtfVerdict.tone.includes("bear") ? P.red : P.amber,
+            }}>
+              {context.mtfVerdict.label}
+            </div>
+          </div>
+
+          {/* Volatility regime */}
+          <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:8, padding:"14px 18px", flex:"1 1 220px", minWidth:200 }}>
+            <div style={{ fontSize:9, letterSpacing:2, color:P.textMuted, textTransform:"uppercase", marginBottom:10, fontFamily:"DM Mono, monospace" }}>
+              BTC volatility regime
+            </div>
+            {context.volRegime ? (
+              <>
+                <div style={{
+                  fontSize:22, fontWeight:600, fontFamily:"DM Mono, monospace", lineHeight:1, marginBottom:4,
+                  color: context.volRegime.tone === "low" ? P.green :
+                         context.volRegime.tone === "normal" ? P.blue :
+                         context.volRegime.tone === "elevated" ? P.amber : P.red,
+                }}>
+                  {context.volRegime.label}
+                </div>
+                <div style={{ fontSize:10, color:P.textSec, fontFamily:"DM Mono, monospace", marginBottom:8 }}>
+                  {context.volPct}% / hour avg
+                </div>
+                <div style={{ fontSize:10, color:P.textSec, lineHeight:1.4 }}>
+                  {context.volRegime.advice}
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize:10, color:P.textMuted }}>Building baseline — need 48h of data</div>
+            )}
+          </div>
+
+          {/* Where am I now — conditional stats */}
+          <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:8, padding:"14px 18px", flex:"1 1 260px", minWidth:240 }}>
+            <div style={{ fontSize:9, letterSpacing:2, color:P.textMuted, textTransform:"uppercase", marginBottom:10, fontFamily:"DM Mono, monospace" }}>
+              Context — last 30 days
+            </div>
+            {context.percentile != null ? (
+              <>
+                <div style={{ fontSize:11, color:P.textSec, marginBottom:6, lineHeight:1.4 }}>
+                  Current breadth <strong style={{ color:bc(context.current) }}>{context.current}%</strong> is in the{" "}
+                  <strong style={{ color:P.textPri }}>{context.percentile}th percentile</strong>
+                </div>
+                <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginBottom:6 }}>
+                  30d range: {context.min30}% – {context.max30}% · avg {context.avg30}%
+                </div>
+                {context.condStats && (
+                  <div style={{ borderTop:`1px solid ${P.border2}`, paddingTop:6, marginTop:6 }}>
+                    <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginBottom:4, letterSpacing:1 }}>
+                      Avg BTC 24h return when breadth:
+                    </div>
+                    {[
+                      { k:"bull",    label:">60 bull",    col:P.green },
+                      { k:"neutral", label:"40–60 neutral", col:P.amber },
+                      { k:"bear",    label:"<40 bear",    col:P.red },
+                    ].map(({ k, label, col }) => {
+                      const stat = context.condStats[k];
+                      return (
+                        <div key={k} style={{ display:"flex", justifyContent:"space-between", fontSize:10, fontFamily:"DM Mono, monospace", marginBottom:2 }}>
+                          <span style={{ color:col }}>{label}</span>
+                          <span style={{ color: stat.avgRet == null ? P.textMuted : stat.avgRet > 0 ? P.green : P.red }}>
+                            {stat.avgRet != null ? `${stat.avgRet > 0 ? "+" : ""}${stat.avgRet.toFixed(2)}%` : "—"}
+                            <span style={{ color:P.textMuted, marginLeft:6 }}>n={stat.n}</span>
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div style={{ fontSize:10, color:P.textMuted }}>Building 30-day baseline…</div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* CHARTS */}
       <div style={{ display:"flex", gap:12, marginBottom:14, flexWrap:"wrap" }}>
         <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:10, padding:"18px 18px 14px", flex:3, minWidth:280 }}>
@@ -738,6 +951,7 @@ export default function App() {
               { key:"eth",        label:"ETH",        state:showETH,       set:setShowETH,       col:P.blue },
               { key:"divergence", label:"Divergence", state:showDivergence, set:setShowDivergence, col:P.red },
               { key:"extremes",   label:"Extremes",   state:showExtremes,  set:setShowExtremes,  col:P.lavender },
+              { key:"momentum",   label:"Momentum",   state:showMomentum,  set:setShowMomentum,  col:P.teal },
             ].map(t => (
               <label key={t.key} style={{
                 display:"flex", alignItems:"center", gap:5, fontSize:10,
@@ -838,6 +1052,45 @@ export default function App() {
               ))}
             </ComposedChart>
           </ResponsiveContainer>
+
+          {/* Breadth momentum (rate of change) histogram */}
+          {showMomentum && visibleHistory.length > 0 && (
+            <div style={{ marginTop:10, paddingTop:10, borderTop:`1px solid ${P.border2}` }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
+                <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>
+                  Breadth momentum · 6h change
+                </div>
+                <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace" }}>
+                  Green = breadth accelerating ↑ · Red = decelerating ↓
+                </div>
+              </div>
+              <ResponsiveContainer width="100%" height={70}>
+                <BarChart data={visibleHistory} margin={{ top:2, right:4, left:-24, bottom:0 }}>
+                  <XAxis dataKey="ts" type="number" scale="time" domain={["dataMin", "dataMax"]} hide/>
+                  <YAxis tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} width={32}/>
+                  <ReferenceLine y={0} stroke={P.border}/>
+                  <Tooltip
+                    content={({ active, payload }) => {
+                      if (!active || !payload?.length) return null;
+                      const d = payload[0]?.payload;
+                      return (
+                        <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:6, padding:"6px 10px", fontSize:10, fontFamily:"DM Mono, monospace" }}>
+                          <div style={{ color:P.textMuted }}>{d?.label}</div>
+                          <div style={{ color: d?.roc6h > 0 ? P.green : d?.roc6h < 0 ? P.red : P.textMuted }}>6h Δ: {d?.roc6h != null ? `${d.roc6h > 0 ? "+" : ""}${d.roc6h}%` : "—"}</div>
+                          <div style={{ color: d?.roc24h > 0 ? P.green : d?.roc24h < 0 ? P.red : P.textMuted }}>24h Δ: {d?.roc24h != null ? `${d.roc24h > 0 ? "+" : ""}${d.roc24h}%` : "—"}</div>
+                        </div>
+                      );
+                    }}
+                  />
+                  <Bar dataKey="roc6h">
+                    {visibleHistory.map((p, i) => (
+                      <Cell key={i} fill={p.roc6h > 0 ? P.green : p.roc6h < 0 ? P.red : P.border} fillOpacity={0.7}/>
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
 
           {visibleHistory.length === 0 && (
             <div style={{ textAlign:"center", padding:"40px 0", color:P.textMuted, fontSize:11, fontFamily:"DM Mono, monospace" }}>
