@@ -15,7 +15,7 @@ const P = {
   lavender:"#8b7fba", teal:"#4a9e9e",
 };
 
-const STORAGE_KEY  = "cbt_v10";
+const STORAGE_KEY  = "cbt_v11";
 const MIN_HOUR_GAP = 15 * 60 * 1000;  // 15 min — captures intraday oscillation
 const MAX_POINTS   = 8640;             // 90 days × 96 points/day (at 15 min intervals)
 
@@ -88,6 +88,13 @@ const RANGE_OPTIONS = [
   {label:"90d", hours:2160},
 ];
 
+const METRIC_OPTIONS = [
+  { key:"aboveSMA24", label:"Above 24h SMA",    desc:"Trend participation" },
+  { key:"aboveSMA7d", label:"Above 7d SMA",     desc:"Slower trend" },
+  { key:"mom24",      label:"Momentum 24h",     desc:"Price vs 24h ago" },
+  { key:"session",    label:"Session (UTC)",    desc:"Price vs 00:00 UTC open" },
+];
+
 // Coins to bootstrap — small reliable set to minimise API calls
 const BOOT_IDS = [
   "bitcoin","ethereum","binancecoin","solana","ripple",
@@ -154,12 +161,16 @@ const saveHistory = pts => {
   catch {}
 };
 
-// ── SPARKLINE → SMA-based breadth (7 days hourly, real data) ────────────
-// For each hour i, compute 24h SMA and check if price[i] > SMA
-// This is the standard breadth indicator methodology (% of coins above MA)
-// Returns BOTH equal-weighted (b24h) and volume-weighted (b24h_vw)
-const SMA_PERIOD = 24; // 24-hour SMA
-const computeSMABreadth = (coins) => {
+// ── SPARKLINE → all breadth metrics (7 days hourly, real data) ─────────
+// Computes four breadth variants at every hour so users can toggle:
+//   - aboveSMA24: % above 24h SMA (trend)
+//   - mom24:      % up vs 24h ago (momentum)
+//   - session:    % up vs most recent 00:00 UTC open (intraday)
+//   - aboveSMA7d: % above 7-day SMA (slower trend)
+const SMA_PERIOD = 24;
+const SMA_7D     = 168;
+
+const computeAllBreadth = (coins) => {
   const data = coins
     .map(c => ({ prices: c.sparkline_in_7d?.price, volume: c.total_volume || 0 }))
     .filter(d => Array.isArray(d.prices) && d.prices.length >= SMA_PERIOD + 1);
@@ -169,10 +180,9 @@ const computeSMABreadth = (coins) => {
   const len = Math.min(...data.map(d => d.prices.length));
   const totalVol = data.reduce((s, d) => s + d.volume, 0) || 1;
   const now = Date.now();
-  const pts = [];
 
-  // Precompute running SMAs for each coin for efficiency
-  const smas = data.map(d => {
+  // Pre-compute running 24h SMAs for each coin
+  const smas24 = data.map(d => {
     const arr = d.prices;
     const sma = new Array(arr.length).fill(null);
     let sum = 0;
@@ -184,43 +194,88 @@ const computeSMABreadth = (coins) => {
     return sma;
   });
 
+  // Pre-compute running 7d SMAs
+  const smas7d = data.map(d => {
+    const arr = d.prices;
+    const sma = new Array(arr.length).fill(null);
+    let sum = 0;
+    for (let i = 0; i < arr.length; i++) {
+      sum += arr[i];
+      if (i >= SMA_7D) sum -= arr[i - SMA_7D];
+      if (i >= SMA_7D - 1) sma[i] = sum / SMA_7D;
+    }
+    return sma;
+  });
+
+  const pts = [];
   for (let i = SMA_PERIOD; i < len; i++) {
-    let adv = 0, advVol = 0;
+    const ts = now - (len - i) * 60 * 60 * 1000;
+    const utcDate = new Date(ts);
+    // Find the index in sparkline corresponding to most recent 00:00 UTC
+    const midnightTs = Date.UTC(utcDate.getUTCFullYear(), utcDate.getUTCMonth(), utcDate.getUTCDate(), 0, 0, 0);
+    const hoursSinceMidnight = Math.floor((ts - midnightTs) / (60 * 60 * 1000));
+    const sessionIdx = i - hoursSinceMidnight;
+
+    let advSMA = 0, advSMAvol = 0;
+    let advMom = 0, advMomVol = 0;
+    let advSess = 0, advSessVol = 0, sessCount = 0, sessVolTotal = 0;
+    let advSMA7 = 0, advSMA7Vol = 0, sma7Count = 0, sma7VolTotal = 0;
+
     for (let j = 0; j < data.length; j++) {
-      const sma = smas[j][i - 1]; // SMA of previous SMA_PERIOD hours (not including current)
-      if (sma != null && data[j].prices[i] > sma) {
-        adv++;
-        advVol += data[j].volume;
+      const d = data[j];
+      const vol = d.volume;
+      const price = d.prices[i];
+
+      // Above 24h SMA
+      const sma24 = smas24[j][i - 1];
+      if (sma24 != null && price > sma24) { advSMA++; advSMAvol += vol; }
+
+      // Momentum 24h
+      if (d.prices[i - 24] != null && price > d.prices[i - 24]) { advMom++; advMomVol += vol; }
+
+      // Session (vs daily open at 00:00 UTC)
+      if (sessionIdx >= 0 && sessionIdx < i) {
+        const openPrice = d.prices[sessionIdx];
+        if (openPrice != null) {
+          sessCount++;
+          sessVolTotal += vol;
+          if (price > openPrice) { advSess++; advSessVol += vol; }
+        }
+      }
+
+      // Above 7d SMA (only available once we have 168+ hours)
+      const sma7 = smas7d[j][i - 1];
+      if (sma7 != null) {
+        sma7Count++;
+        sma7VolTotal += vol;
+        if (price > sma7) { advSMA7++; advSMA7Vol += vol; }
       }
     }
-    const b24h    = Math.round(adv / data.length * 100);
-    const b24h_vw = Math.round(advVol / totalVol * 100);
 
-    const ts = now - (len - i) * 60 * 60 * 1000;
-    pts.push({ ts, ...mkLabel(ts), b24h, b24h_vw, b7d:null, seeded:false, real:true, src:"sparkline" });
+    pts.push({
+      ts, ...mkLabel(ts),
+      aboveSMA24:    Math.round(advSMA / data.length * 100),
+      aboveSMA24_vw: Math.round(advSMAvol / totalVol * 100),
+      mom24:         Math.round(advMom / data.length * 100),
+      mom24_vw:      Math.round(advMomVol / totalVol * 100),
+      session:       sessCount > 5 ? Math.round(advSess / sessCount * 100) : null,
+      session_vw:    sessVolTotal > 0 ? Math.round(advSessVol / sessVolTotal * 100) : null,
+      aboveSMA7d:    sma7Count > 5 ? Math.round(advSMA7 / sma7Count * 100) : null,
+      aboveSMA7d_vw: sma7VolTotal > 0 ? Math.round(advSMA7Vol / sma7VolTotal * 100) : null,
+      // Keep b24h/b24h_vw as aliases for backwards compat (defaults to aboveSMA24)
+      b24h:          Math.round(advSMA / data.length * 100),
+      b24h_vw:       Math.round(advSMAvol / totalVol * 100),
+      b7d:           null,
+      seeded: false, real: true, src: "sparkline",
+    });
   }
   return pts;
 };
 
-// Current snapshot: % of coins above their 24h SMA right now
-const currentSMABreadth = (coins) => {
-  let count = 0, adv = 0, totalVol = 0, advVol = 0;
-  for (const c of coins) {
-    const prices = c.sparkline_in_7d?.price;
-    if (!prices || prices.length < SMA_PERIOD + 1) continue;
-    const i = prices.length - 1;
-    let sum = 0;
-    for (let k = i - SMA_PERIOD; k < i; k++) sum += prices[k];
-    const sma = sum / SMA_PERIOD;
-    const vol = c.total_volume || 0;
-    count++;
-    totalVol += vol;
-    if (prices[i] > sma) { adv++; advVol += vol; }
-  }
-  return {
-    b:   count > 0    ? Math.round(adv / count * 100)    : null,
-    bvw: totalVol > 0 ? Math.round(advVol / totalVol * 100) : null,
-  };
+// Current snapshot of all metrics from latest sparkline point
+const currentAllBreadth = (coins) => {
+  const pts = computeAllBreadth(coins);
+  return pts.length > 0 ? pts[pts.length - 1] : null;
 };
 
 // ── BOOTSTRAP: fetch daily closes, compute daily 24h breadth ──────────
@@ -360,6 +415,7 @@ export default function App() {
   const [sortKey, setSortKey]       = useState("market_cap");
   const [sortDir, setSortDir]       = useState("desc");
   const [range, setRange]           = useState(168); // default 7d — guaranteed real data
+  const [metric, setMetric]         = useState("aboveSMA24"); // chart metric selector
   const didBoot = useRef(false);
 
   useEffect(() => {
@@ -388,12 +444,12 @@ export default function App() {
       setLastUpdate(new Date());
       setError(null);
 
-      // Derive real SMA-based breadth from sparkline prices
-      const sparklinePts = computeSMABreadth(filtered);
-      const smaNow = currentSMABreadth(filtered);
-      const b24    = smaNow.b;     // % above 24h SMA (the primary chart metric)
-      const b24vw  = smaNow.bvw;   // volume-weighted version
-      const b7     = calcBreadth(filtered, "7d");
+      // Derive all breadth metrics from sparkline prices
+      const sparklinePts = computeAllBreadth(filtered);
+      const snap  = currentAllBreadth(filtered);
+      const b24   = snap?.aboveSMA24 ?? null;
+      const b24vw = snap?.aboveSMA24_vw ?? null;
+      const b7    = calcBreadth(filtered, "7d");
 
       setHistory(prev => {
         const stored = prev.length > 0 ? prev : (loadHistory() || []);
@@ -412,7 +468,21 @@ export default function App() {
         const lastLive = [...base].reverse().find(p => p.real && p.src === "live");
         const now = Date.now();
         if (b24 != null && (!lastLive || now - lastLive.ts >= MIN_HOUR_GAP)) {
-          base = [...base, { ts:now, ...mkLabel(now), b24h:b24, b24h_vw:b24vw, b7d:b7, seeded:false, real:true, src:"live" }];
+          base = [...base, {
+            ts:now, ...mkLabel(now),
+            aboveSMA24:    snap?.aboveSMA24,
+            aboveSMA24_vw: snap?.aboveSMA24_vw,
+            mom24:         snap?.mom24,
+            mom24_vw:      snap?.mom24_vw,
+            session:       snap?.session,
+            session_vw:    snap?.session_vw,
+            aboveSMA7d:    snap?.aboveSMA7d,
+            aboveSMA7d_vw: snap?.aboveSMA7d_vw,
+            b24h:          b24,
+            b24h_vw:       b24vw,
+            b7d:           b7,
+            seeded:false, real:true, src:"live",
+          }];
         }
 
         base = base.sort((a,b) => a.ts - b.ts).slice(-MAX_POINTS);
@@ -445,22 +515,19 @@ export default function App() {
   const visibleHistory = useMemo(() => {
     if (!history.length) return [];
     const cutoff = Date.now() - range * 60 * 60 * 1000;
-    const pts = history.filter(p => p.ts >= cutoff && p.b24h != null);
-    // For longer ranges thin to ~500 points so chart stays readable
+    const pts = history.filter(p => p.ts >= cutoff && p[metric] != null);
     const maxPts = range <= 168 ? pts.length : 500;
     if (pts.length <= maxPts) return pts;
     const step = Math.ceil(pts.length / maxPts);
     return pts.filter((_, i) => i % step === 0 || i === pts.length - 1);
-  }, [history, range]);
+  }, [history, range, metric]);
 
   const m = useMemo(() => {
     if (!coins.length) return null;
     const b1 = calcBreadth(coins, "1h");
-    // 24h breadth uses SMA-based calculation (% above 24h SMA)
-    const smaNow = currentSMABreadth(coins);
-    const b24 = smaNow.b;
-    const vw24 = smaNow.bvw;
-    // Fallback to momentum-based if sparkline unavailable
+    const snap = currentAllBreadth(coins);
+    const b24 = snap?.aboveSMA24 ?? null;
+    const vw24 = snap?.aboveSMA24_vw ?? null;
     const b24Momentum = calcBreadth(coins, "24h");
     const b7  = calcBreadth(coins, "7d");
     const b30 = calcBreadth(coins, "30d");
@@ -477,7 +544,7 @@ export default function App() {
     });
     const sectors = Object.entries(secMap).map(([name,d])=>({name,pct:Math.round(d.adv/d.total*100),adv:d.adv,total:d.total})).sort((a,b)=>b.total-a.total);
     const sorted = [...coins].filter(c=>c[k24]!=null).sort((a,b)=>b[k24]-a[k24]);
-    return { b1, b24, b7, b30, vw24, b24Momentum, regime:r, regimeMeta:r?REGIME_META[r]:REGIME_META.NEUTRAL, adv, dec, sectors, gainers:sorted.slice(0,8), losers:sorted.slice(-8).reverse() };
+    return { b1, b24, b7, b30, vw24, b24Momentum, snap, regime:r, regimeMeta:r?REGIME_META[r]:REGIME_META.NEUTRAL, adv, dec, sectors, gainers:sorted.slice(0,8), losers:sorted.slice(-8).reverse() };
   }, [coins]);
 
   const thrustAlert = useMemo(() => {
@@ -569,14 +636,33 @@ export default function App() {
         <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:10, padding:"18px 18px 14px", flex:3, minWidth:280 }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10, flexWrap:"wrap", gap:8 }}>
             <div>
-              <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>Breadth — % of coins above their 24h SMA</div>
-              <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginTop:2 }}>Trend participation indicator · standard market breadth methodology</div>
+              <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>
+                Breadth — {METRIC_OPTIONS.find(o => o.key === metric)?.label}
+              </div>
+              <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginTop:2 }}>
+                {METRIC_OPTIONS.find(o => o.key === metric)?.desc} · toggle metrics below to find the one that matches your reference
+              </div>
             </div>
             <div style={{ display:"flex", gap:4, alignItems:"center", flexWrap:"wrap" }}>
               {RANGE_OPTIONS.map(opt => (
                 <button key={opt.label} onClick={()=>setRange(opt.hours)} style={{ background:range===opt.hours?P.greenPale:"none", border:`1px solid ${range===opt.hours?P.green:P.border}`, color:range===opt.hours?P.green:P.textMuted, padding:"3px 10px", cursor:"pointer", fontSize:10, fontFamily:"DM Mono, monospace", borderRadius:20, transition:"all 0.15s" }}>{opt.label}</button>
               ))}
             </div>
+          </div>
+
+          {/* Metric selector */}
+          <div style={{ display:"flex", gap:4, marginBottom:10, flexWrap:"wrap" }}>
+            {METRIC_OPTIONS.map(opt => (
+              <button key={opt.key} onClick={()=>setMetric(opt.key)} style={{
+                background:metric===opt.key?P.lavender+"20":"none",
+                border:`1px solid ${metric===opt.key?P.lavender:P.border}`,
+                color:metric===opt.key?P.lavender:P.textMuted,
+                padding:"4px 10px", cursor:"pointer", fontSize:10,
+                fontFamily:"DM Mono, monospace", borderRadius:4, transition:"all 0.15s",
+              }}>
+                {opt.label}
+              </button>
+            ))}
           </div>
           <div style={{ display:"flex", gap:14, marginBottom:6, flexWrap:"wrap" }}>
             {[["Bull >60%",P.green],["Neutral 40–60%",P.textMuted],["Bear <40%",P.red]].map(([lbl,col])=>(
@@ -610,8 +696,8 @@ export default function App() {
               <ReferenceLine y={60} stroke={`${P.green}55`}     strokeDasharray="4 4"/>
               <ReferenceLine y={50} stroke={`${P.textMuted}40`} strokeDasharray="2 4"/>
               <ReferenceLine y={40} stroke={`${P.red}55`}       strokeDasharray="4 4"/>
-              <Area dataKey="b24h_vw" name="24h VW" stroke={P.lavender} fill="url(#gvw)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} connectNulls/>
-              <Area dataKey="b24h"    name="24h EW" stroke={chartColor} fill="url(#g24)" strokeWidth={2}   dot={false} connectNulls/>
+              <Area dataKey={`${metric}_vw`} name="Volume-weighted" stroke={P.lavender} fill="url(#gvw)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} connectNulls/>
+              <Area dataKey={metric}          name="Equal-weighted"  stroke={chartColor} fill="url(#g24)" strokeWidth={2}   dot={false} connectNulls/>
             </AreaChart>
           </ResponsiveContainer>
 
