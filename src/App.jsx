@@ -775,7 +775,9 @@ export default function App() {
                 axisLine={false}
                 tickFormatter={ts => {
                   const d = new Date(ts);
-                  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+                  const day = d.toLocaleDateString([], { weekday: "short" });
+                  const date = d.toLocaleDateString([], { month: "short", day: "numeric" });
+                  return `${day} ${date}`;
                 }}
                 minTickGap={50}
               />
@@ -784,7 +786,7 @@ export default function App() {
 
               {/* Weekend shading */}
               {showWeekends && weekendRanges.map((r, i) => (
-                <ReferenceArea key={`wk-${i}`} x1={r.x1} x2={r.x2} fill={P.textMuted} fillOpacity={0.07} ifOverflow="extendDomain"/>
+                <ReferenceArea key={`wk-${i}`} x1={r.x1} x2={r.x2} fill={P.textSec} fillOpacity={0.18} ifOverflow="extendDomain"/>
               ))}
 
               {/* Regime lines */}
