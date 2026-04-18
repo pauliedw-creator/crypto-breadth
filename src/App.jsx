@@ -15,7 +15,7 @@ const P = {
   lavender:"#8b7fba", teal:"#4a9e9e",
 };
 
-const STORAGE_KEY  = "cbt_v9";
+const STORAGE_KEY  = "cbt_v10";
 const MIN_HOUR_GAP = 15 * 60 * 1000;  // 15 min — captures intraday oscillation
 const MAX_POINTS   = 8640;             // 90 days × 96 points/day (at 15 min intervals)
 
@@ -154,15 +154,15 @@ const saveHistory = pts => {
   catch {}
 };
 
-// ── SPARKLINE → 24h breadth (7 days hourly, real data) ────────────────
-// For each hour i, compute % of coins where price[i] > price[i-24]
+// ── SPARKLINE → SMA-based breadth (7 days hourly, real data) ────────────
+// For each hour i, compute 24h SMA and check if price[i] > SMA
+// This is the standard breadth indicator methodology (% of coins above MA)
 // Returns BOTH equal-weighted (b24h) and volume-weighted (b24h_vw)
-// Note: historical volume isn't available — we use current volume as weight,
-// which is a reasonable approximation (coin volumes are relatively stable week-over-week)
-const sparklineTo24hBreadth = (coins) => {
+const SMA_PERIOD = 24; // 24-hour SMA
+const computeSMABreadth = (coins) => {
   const data = coins
     .map(c => ({ prices: c.sparkline_in_7d?.price, volume: c.total_volume || 0 }))
-    .filter(d => Array.isArray(d.prices) && d.prices.length >= 25);
+    .filter(d => Array.isArray(d.prices) && d.prices.length >= SMA_PERIOD + 1);
 
   if (data.length < 10) return [];
 
@@ -171,24 +171,56 @@ const sparklineTo24hBreadth = (coins) => {
   const now = Date.now();
   const pts = [];
 
-  for (let i = 24; i < len; i++) {
-    // Equal-weighted: each coin counts once
-    const adv  = data.filter(d => d.prices[i] > d.prices[i - 24]).length;
-    const b24h = Math.round(adv / data.length * 100);
+  // Precompute running SMAs for each coin for efficiency
+  const smas = data.map(d => {
+    const arr = d.prices;
+    const sma = new Array(arr.length).fill(null);
+    let sum = 0;
+    for (let i = 0; i < arr.length; i++) {
+      sum += arr[i];
+      if (i >= SMA_PERIOD) sum -= arr[i - SMA_PERIOD];
+      if (i >= SMA_PERIOD - 1) sma[i] = sum / SMA_PERIOD;
+    }
+    return sma;
+  });
 
-    // Volume-weighted: coins count proportional to their volume
-    const advVol = data.filter(d => d.prices[i] > d.prices[i - 24])
-                       .reduce((s, d) => s + d.volume, 0);
+  for (let i = SMA_PERIOD; i < len; i++) {
+    let adv = 0, advVol = 0;
+    for (let j = 0; j < data.length; j++) {
+      const sma = smas[j][i - 1]; // SMA of previous SMA_PERIOD hours (not including current)
+      if (sma != null && data[j].prices[i] > sma) {
+        adv++;
+        advVol += data[j].volume;
+      }
+    }
+    const b24h    = Math.round(adv / data.length * 100);
     const b24h_vw = Math.round(advVol / totalVol * 100);
 
-    // 7d context
-    const adv7 = i >= 168 ? data.filter(d => d.prices[i] > d.prices[i - 168]).length : null;
-    const b7d  = adv7 != null ? Math.round(adv7 / data.length * 100) : null;
-
     const ts = now - (len - i) * 60 * 60 * 1000;
-    pts.push({ ts, ...mkLabel(ts), b24h, b24h_vw, b7d, seeded:false, real:true, src:"sparkline" });
+    pts.push({ ts, ...mkLabel(ts), b24h, b24h_vw, b7d:null, seeded:false, real:true, src:"sparkline" });
   }
   return pts;
+};
+
+// Current snapshot: % of coins above their 24h SMA right now
+const currentSMABreadth = (coins) => {
+  let count = 0, adv = 0, totalVol = 0, advVol = 0;
+  for (const c of coins) {
+    const prices = c.sparkline_in_7d?.price;
+    if (!prices || prices.length < SMA_PERIOD + 1) continue;
+    const i = prices.length - 1;
+    let sum = 0;
+    for (let k = i - SMA_PERIOD; k < i; k++) sum += prices[k];
+    const sma = sum / SMA_PERIOD;
+    const vol = c.total_volume || 0;
+    count++;
+    totalVol += vol;
+    if (prices[i] > sma) { adv++; advVol += vol; }
+  }
+  return {
+    b:   count > 0    ? Math.round(adv / count * 100)    : null,
+    bvw: totalVol > 0 ? Math.round(advVol / totalVol * 100) : null,
+  };
 };
 
 // ── BOOTSTRAP: fetch daily closes, compute daily 24h breadth ──────────
@@ -356,11 +388,12 @@ export default function App() {
       setLastUpdate(new Date());
       setError(null);
 
-      // Derive real 24h breadth from sparkline prices
-      const sparklinePts = sparklineTo24hBreadth(filtered);
-      const b24  = calcBreadth(filtered, "24h");
-      const b7   = calcBreadth(filtered, "7d");
-      const vw24 = calcVWBreadth(filtered, "24h");
+      // Derive real SMA-based breadth from sparkline prices
+      const sparklinePts = computeSMABreadth(filtered);
+      const smaNow = currentSMABreadth(filtered);
+      const b24    = smaNow.b;     // % above 24h SMA (the primary chart metric)
+      const b24vw  = smaNow.bvw;   // volume-weighted version
+      const b7     = calcBreadth(filtered, "7d");
 
       setHistory(prev => {
         const stored = prev.length > 0 ? prev : (loadHistory() || []);
@@ -379,7 +412,7 @@ export default function App() {
         const lastLive = [...base].reverse().find(p => p.real && p.src === "live");
         const now = Date.now();
         if (b24 != null && (!lastLive || now - lastLive.ts >= MIN_HOUR_GAP)) {
-          base = [...base, { ts:now, ...mkLabel(now), b24h:b24, b24h_vw:vw24, b7d:b7, seeded:false, real:true, src:"live" }];
+          base = [...base, { ts:now, ...mkLabel(now), b24h:b24, b24h_vw:b24vw, b7d:b7, seeded:false, real:true, src:"live" }];
         }
 
         base = base.sort((a,b) => a.ts - b.ts).slice(-MAX_POINTS);
@@ -422,22 +455,29 @@ export default function App() {
 
   const m = useMemo(() => {
     if (!coins.length) return null;
-    const b1=calcBreadth(coins,"1h"), b24=calcBreadth(coins,"24h"),
-          b7=calcBreadth(coins,"7d"), b30=calcBreadth(coins,"30d"),
-          vw24=calcVWBreadth(coins,"24h"), r=getRegime(b24,b7);
-    const k24=PCT_KEY["24h"];
-    const adv=coins.filter(c=>(c[k24]??c.price_change_percentage_24h??0)>0).length;
-    const dec=coins.filter(c=>(c[k24]??c.price_change_percentage_24h??0)<0).length;
-    const secMap={};
-    coins.forEach(c=>{
-      const s=SECTOR_MAP[c.symbol?.toUpperCase()]||"Other";
-      if(!secMap[s])secMap[s]={adv:0,total:0};
+    const b1 = calcBreadth(coins, "1h");
+    // 24h breadth uses SMA-based calculation (% above 24h SMA)
+    const smaNow = currentSMABreadth(coins);
+    const b24 = smaNow.b;
+    const vw24 = smaNow.bvw;
+    // Fallback to momentum-based if sparkline unavailable
+    const b24Momentum = calcBreadth(coins, "24h");
+    const b7  = calcBreadth(coins, "7d");
+    const b30 = calcBreadth(coins, "30d");
+    const r   = getRegime(b24 ?? b24Momentum, b7);
+    const k24 = PCT_KEY["24h"];
+    const adv = coins.filter(c => (c[k24] ?? c.price_change_percentage_24h ?? 0) > 0).length;
+    const dec = coins.filter(c => (c[k24] ?? c.price_change_percentage_24h ?? 0) < 0).length;
+    const secMap = {};
+    coins.forEach(c => {
+      const s = SECTOR_MAP[c.symbol?.toUpperCase()] || "Other";
+      if (!secMap[s]) secMap[s] = { adv:0, total:0 };
       secMap[s].total++;
-      if((c[k24]??c.price_change_percentage_24h??0)>0)secMap[s].adv++;
+      if ((c[k24] ?? c.price_change_percentage_24h ?? 0) > 0) secMap[s].adv++;
     });
-    const sectors=Object.entries(secMap).map(([name,d])=>({name,pct:Math.round(d.adv/d.total*100),adv:d.adv,total:d.total})).sort((a,b)=>b.total-a.total);
-    const sorted=[...coins].filter(c=>c[k24]!=null).sort((a,b)=>b[k24]-a[k24]);
-    return { b1,b24,b7,b30,vw24, regime:r, regimeMeta:r?REGIME_META[r]:REGIME_META.NEUTRAL, adv,dec,sectors, gainers:sorted.slice(0,8), losers:sorted.slice(-8).reverse() };
+    const sectors = Object.entries(secMap).map(([name,d])=>({name,pct:Math.round(d.adv/d.total*100),adv:d.adv,total:d.total})).sort((a,b)=>b.total-a.total);
+    const sorted = [...coins].filter(c=>c[k24]!=null).sort((a,b)=>b[k24]-a[k24]);
+    return { b1, b24, b7, b30, vw24, b24Momentum, regime:r, regimeMeta:r?REGIME_META[r]:REGIME_META.NEUTRAL, adv, dec, sectors, gainers:sorted.slice(0,8), losers:sorted.slice(-8).reverse() };
   }, [coins]);
 
   const thrustAlert = useMemo(() => {
@@ -515,12 +555,12 @@ export default function App() {
       {/* METRIC CARDS */}
       {m && (
         <div style={{ display:"flex", gap:8, marginBottom:14, flexWrap:"wrap" }}>
-          <MetricCard label="1h Breadth"  value={m.b1  != null?`${m.b1}%`:"—"}  pct={m.b1}/>
-          <MetricCard label="24h Breadth" value={m.b24 != null?`${m.b24}%`:"—"} pct={m.b24} sub={`VW ${m.vw24??"—"}%`}/>
-          <MetricCard label="7d Breadth"  value={m.b7  != null?`${m.b7}%`:"—"}  pct={m.b7}/>
-          <MetricCard label="30d Breadth" value={m.b30 != null?`${m.b30}%`:"—"} pct={m.b30}/>
-          <MetricCard label="Advancing"   value={m.adv} pct={70} sub={`of ${m.adv+m.dec}`}/>
-          <MetricCard label="Declining"   value={m.dec} pct={30}/>
+          <MetricCard label="1h Breadth"    value={m.b1  != null?`${m.b1}%`:"—"}  pct={m.b1}/>
+          <MetricCard label="% Above 24h SMA" value={m.b24 != null?`${m.b24}%`:"—"} pct={m.b24} sub={`VW ${m.vw24??"—"}% · Mom ${m.b24Momentum??"—"}%`}/>
+          <MetricCard label="7d Breadth"    value={m.b7  != null?`${m.b7}%`:"—"}  pct={m.b7}/>
+          <MetricCard label="30d Breadth"   value={m.b30 != null?`${m.b30}%`:"—"} pct={m.b30}/>
+          <MetricCard label="Advancing"     value={m.adv} pct={70} sub={`of ${m.adv+m.dec}`}/>
+          <MetricCard label="Declining"     value={m.dec} pct={30}/>
         </div>
       )}
 
@@ -529,8 +569,8 @@ export default function App() {
         <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:10, padding:"18px 18px 14px", flex:3, minWidth:280 }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10, flexWrap:"wrap", gap:8 }}>
             <div>
-              <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>24h Breadth — equal-weighted vs volume-weighted</div>
-              <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginTop:2 }}>Divergence between the two signals a narrow rally led by majors</div>
+              <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>Breadth — % of coins above their 24h SMA</div>
+              <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginTop:2 }}>Trend participation indicator · standard market breadth methodology</div>
             </div>
             <div style={{ display:"flex", gap:4, alignItems:"center", flexWrap:"wrap" }}>
               {RANGE_OPTIONS.map(opt => (
