@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
-  AreaChart, Area, XAxis, YAxis, CartesianGrid,
+  AreaChart, Area, ComposedChart, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, ReferenceLine,
+  ReferenceArea, ReferenceDot, Line,
 } from "recharts";
 
 const P = {
@@ -15,7 +16,7 @@ const P = {
   lavender:"#8b7fba", teal:"#4a9e9e",
 };
 
-const STORAGE_KEY  = "cbt_bybit_v2";
+const STORAGE_KEY  = "cbt_bybit_v3";
 const MIN_HOUR_GAP = 15 * 60 * 1000;
 const MAX_POINTS   = 3000;
 
@@ -203,24 +204,45 @@ const fetchAllBybitHistory = async (coins, onProgress) => {
   return priceData;
 };
 
-// ── Compute momentum breadth at 1h, 24h, 7d, 30d windows ─────────────
-// mom_N at time t = % of coins where price[t] > price[t-N hours]
-const computeBreadthFromBybit = (priceData) => {
-  const coinIds = Object.keys(priceData);
-  if (coinIds.length < 10) return [];
+// ── Compute momentum breadth with optional sector filter ──────────────
+// Also attaches normalised BTC and ETH price for overlay display
+const computeBreadthFromBybit = (priceData, sectorFilter = null) => {
+  let coinIds = Object.keys(priceData);
+
+  // Apply sector filter if specified (but always keep BTC/ETH for price overlays)
+  const filteredIds = sectorFilter
+    ? coinIds.filter(id => {
+        const sym = priceData[id].symbol;
+        const sec = SECTOR_MAP[sym] || "Other";
+        return sec === sectorFilter;
+      })
+    : coinIds;
+
+  if (filteredIds.length < 5) return [];
+
+  // Find BTC and ETH entries (by symbol, regardless of filter)
+  const btcId = coinIds.find(id => priceData[id].symbol === "BTC");
+  const ethId = coinIds.find(id => priceData[id].symbol === "ETH");
 
   // Use the coin with most data as the time reference
-  const refId = coinIds.reduce((a, b) =>
+  const refId = filteredIds.reduce((a, b) =>
     priceData[a].prices.length >= priceData[b].prices.length ? a : b);
   const refTimestamps = priceData[refId].prices.map(p => p.ts);
 
-  // Build O(1) timestamp→index lookup per coin
+  // Build O(1) timestamp→index lookup per coin (only for filtered set + BTC/ETH)
+  const needed = new Set(filteredIds);
+  if (btcId) needed.add(btcId);
+  if (ethId) needed.add(ethId);
   const priceIndex = {};
-  for (const id of coinIds) {
+  for (const id of needed) {
     const idx = new Map();
     priceData[id].prices.forEach((p, i) => idx.set(p.ts, i));
     priceIndex[id] = idx;
   }
+
+  // Pre-compute BTC and ETH price ranges for normalisation across visible window
+  const btcPrices = btcId ? priceData[btcId].prices : null;
+  const ethPrices = ethId ? priceData[ethId].prices : null;
 
   const pts = [];
   for (let ri = 24; ri < refTimestamps.length; ri++) {
@@ -231,36 +253,31 @@ const computeBreadthFromBybit = (priceData) => {
     let adv7d = 0, c7d = 0;
     let adv30 = 0, c30 = 0;
 
-    for (const id of coinIds) {
+    for (const id of filteredIds) {
       const idx = priceIndex[id].get(ts);
       if (idx === undefined) continue;
       const prices = priceData[id].prices;
       const price  = prices[idx].close;
       count++;
 
-      // 1h
-      if (idx >= 1) {
-        c1++;
-        if (price > prices[idx - 1].close) adv1++;
-      }
-      // 24h
-      if (idx >= 24) {
-        c24++;
-        if (price > prices[idx - 24].close) adv24++;
-      }
-      // 7d
-      if (idx >= 168) {
-        c7d++;
-        if (price > prices[idx - 168].close) adv7d++;
-      }
-      // 30d (approximate — we have max ~41 days)
-      if (idx >= 720) {
-        c30++;
-        if (price > prices[idx - 720].close) adv30++;
-      }
+      if (idx >= 1)   { c1++;  if (price > prices[idx - 1].close)   adv1++; }
+      if (idx >= 24)  { c24++; if (price > prices[idx - 24].close)  adv24++; }
+      if (idx >= 168) { c7d++; if (price > prices[idx - 168].close) adv7d++; }
+      if (idx >= 720) { c30++; if (price > prices[idx - 720].close) adv30++; }
     }
 
-    if (count < 10) continue;
+    if (count < 5) continue;
+
+    // Attach raw BTC/ETH prices at this timestamp (normalisation happens later in visibleHistory)
+    let btcPrice = null, ethPrice = null;
+    if (btcPrices) {
+      const bi = priceIndex[btcId].get(ts);
+      if (bi !== undefined) btcPrice = btcPrices[bi].close;
+    }
+    if (ethPrices) {
+      const ei = priceIndex[ethId].get(ts);
+      if (ei !== undefined) ethPrice = ethPrices[ei].close;
+    }
 
     pts.push({
       ts, ...mkLabel(ts),
@@ -268,6 +285,7 @@ const computeBreadthFromBybit = (priceData) => {
       mom24:  c24 > 0 ? Math.round(adv24 / c24 * 100) : null,
       mom7d:  c7d > 0 ? Math.round(adv7d / c7d * 100) : null,
       mom30d: c30 > 0 ? Math.round(adv30 / c30 * 100) : null,
+      btcPrice, ethPrice,
       seeded: false, real: true, src: "bybit",
     });
   }
@@ -311,11 +329,25 @@ const SectorRow = ({ name, pct, adv, total }) => {
 
 const CustomTooltip = ({ active, payload }) => {
   if (!active || !payload?.length) return null;
-  const fullLabel = payload[0]?.payload?.label ?? "";
+  const d = payload[0]?.payload;
+  if (!d) return null;
+  const fmt$ = v => v == null ? "—" : v >= 1000 ? `$${v.toLocaleString(undefined,{maximumFractionDigits:0})}` : `$${v.toFixed(2)}`;
   return (
     <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:8, padding:"10px 14px", fontSize:11, fontFamily:"DM Mono, monospace", boxShadow:"0 4px 20px rgba(0,0,0,0.08)" }}>
-      <div style={{ color:P.textMuted, marginBottom:6, fontSize:10 }}>{fullLabel}</div>
-      {payload.map(p => <div key={p.dataKey} style={{ color:p.color||P.textSec, marginBottom:3 }}>{p.name}: {p.value != null ? `${p.value}%` : "—"}</div>)}
+      <div style={{ color:P.textMuted, marginBottom:6, fontSize:10 }}>{d.label}</div>
+      <div style={{ color: bc(d.mom24), marginBottom:3 }}>Breadth: {d.mom24 != null ? `${d.mom24}%` : "—"}</div>
+      {d.btcPrice != null && payload.some(p => p.dataKey === "btcNorm") && (
+        <div style={{ color:P.amber, marginBottom:3 }}>BTC: {fmt$(d.btcPrice)}</div>
+      )}
+      {d.ethPrice != null && payload.some(p => p.dataKey === "ethNorm") && (
+        <div style={{ color:P.blue, marginBottom:3 }}>ETH: {fmt$(d.ethPrice)}</div>
+      )}
+      {d.divergence && (
+        <div style={{ color: d.divergence === "bearish" ? P.red : P.green, marginTop:4, fontSize:10 }}>⚠ {d.divergence} divergence</div>
+      )}
+      {d.extreme && (
+        <div style={{ color: d.extreme === "high" ? P.green : P.red, marginTop:4, fontSize:10 }}>● extreme {d.extreme}</div>
+      )}
     </div>
   );
 };
@@ -346,6 +378,7 @@ export default function App() {
   const [error, setError]           = useState(null);
   const [lastUpdate, setLastUpdate] = useState(null);
   const [history, setHistory]       = useState([]);
+  const [priceData, setPriceData]   = useState(null); // raw Bybit data for recomputing
   const [refreshing, setRefreshing] = useState(false);
   const [bootstrapping, setBootstrapping] = useState(false);
   const [bootPct, setBootPct]       = useState(0);
@@ -354,6 +387,13 @@ export default function App() {
   const [sortKey, setSortKey]       = useState("market_cap");
   const [sortDir, setSortDir]       = useState("desc");
   const [range, setRange]           = useState(336); // default 14d
+  const [sectorFilter, setSectorFilter] = useState(null);
+  // Chart overlay toggles
+  const [showWeekends, setShowWeekends] = useState(true);
+  const [showBTC, setShowBTC]           = useState(false);
+  const [showETH, setShowETH]           = useState(false);
+  const [showDivergence, setShowDivergence] = useState(false);
+  const [showExtremes, setShowExtremes] = useState(false);
   const bootRan = useRef(false);
 
   useEffect(() => {
@@ -410,12 +450,13 @@ export default function App() {
       setBootstrapping(true);
       setBootStatus("Connecting to Bybit…");
       try {
-        const priceData = await fetchAllBybitHistory(coins, pct => {
+        const pd = await fetchAllBybitHistory(coins, pct => {
           setBootPct(pct);
           setBootStatus(`${pct}% — fetching 41 days of hourly klines`);
         });
         setBootStatus("Computing breadth metrics…");
-        const pts = computeBreadthFromBybit(priceData);
+        setPriceData(pd); // store for recompute on sector change
+        const pts = computeBreadthFromBybit(pd, null);
         console.log(`[Bybit] Computed ${pts.length} breadth points`);
         if (pts.length > 0) {
           setHistory(pts);
@@ -434,13 +475,23 @@ export default function App() {
     runBybit();
   }, [coins]);
 
+  // Recompute breadth when sector filter changes (no re-fetch)
+  useEffect(() => {
+    if (!priceData) return;
+    const pts = computeBreadthFromBybit(priceData, sectorFilter);
+    if (pts.length > 0) {
+      setHistory(pts);
+    }
+  }, [sectorFilter, priceData]);
+
   // ── Periodic Bybit refresh every 10 minutes to keep latest bar current ──
   useEffect(() => {
     if (!coins.length) return;
     const id = setInterval(async () => {
       try {
-        const priceData = await fetchAllBybitHistory(coins, () => {});
-        const pts = computeBreadthFromBybit(priceData);
+        const pd = await fetchAllBybitHistory(coins, () => {});
+        setPriceData(pd);
+        const pts = computeBreadthFromBybit(pd, sectorFilter);
         if (pts.length > 0) {
           setHistory(pts);
           saveHistory(pts);
@@ -450,17 +501,79 @@ export default function App() {
       }
     }, 10 * 60_000);
     return () => clearInterval(id);
-  }, [coins]);
+  }, [coins, sectorFilter]);
 
   const visibleHistory = useMemo(() => {
     if (!history.length) return [];
     const cutoff = Date.now() - range * 60 * 60 * 1000;
-    const pts = history.filter(p => p.ts >= cutoff && p.mom24 != null);
+    let pts = history.filter(p => p.ts >= cutoff && p.mom24 != null);
     const maxPts = range <= 168 ? pts.length : 500;
-    if (pts.length <= maxPts) return pts;
-    const step = Math.ceil(pts.length / maxPts);
-    return pts.filter((_, i) => i % step === 0 || i === pts.length - 1);
+    if (pts.length > maxPts) {
+      const step = Math.ceil(pts.length / maxPts);
+      pts = pts.filter((_, i) => i % step === 0 || i === pts.length - 1);
+    }
+
+    // Normalise BTC/ETH prices to 0-100 for overlay on breadth chart
+    const btcVals = pts.map(p => p.btcPrice).filter(v => v != null);
+    const ethVals = pts.map(p => p.ethPrice).filter(v => v != null);
+    const btcMin = btcVals.length ? Math.min(...btcVals) : 0;
+    const btcMax = btcVals.length ? Math.max(...btcVals) : 1;
+    const ethMin = ethVals.length ? Math.min(...ethVals) : 0;
+    const ethMax = ethVals.length ? Math.max(...ethVals) : 1;
+    const btcRange = btcMax - btcMin || 1;
+    const ethRange = ethMax - ethMin || 1;
+
+    // Detect divergences: local peaks/troughs in breadth vs BTC
+    // Simple approach: compare each point's breadth and BTC value against their recent trends
+    const withOverlay = pts.map((p, i) => {
+      const norm = {
+        btcNorm: p.btcPrice != null ? ((p.btcPrice - btcMin) / btcRange) * 100 : null,
+        ethNorm: p.ethPrice != null ? ((p.ethPrice - ethMin) / ethRange) * 100 : null,
+      };
+      return { ...p, ...norm };
+    });
+
+    // Mark extremes (breadth >80 or <20) as reference points
+    withOverlay.forEach(p => {
+      p.extreme = p.mom24 >= 80 ? "high" : p.mom24 <= 20 ? "low" : null;
+    });
+
+    // Mark divergences using a sliding window: compare 24h-ago breadth-vs-BTC trend
+    const WINDOW = 24;
+    for (let i = WINDOW; i < withOverlay.length; i++) {
+      const cur = withOverlay[i];
+      const prev = withOverlay[i - WINDOW];
+      if (cur.mom24 == null || prev.mom24 == null || cur.btcNorm == null || prev.btcNorm == null) continue;
+      const priceDelta   = cur.btcNorm - prev.btcNorm;
+      const breadthDelta = cur.mom24   - prev.mom24;
+      // Bearish divergence: price up meaningfully, breadth down meaningfully
+      if (priceDelta > 10 && breadthDelta < -12) cur.divergence = "bearish";
+      // Bullish divergence: price down meaningfully, breadth up meaningfully
+      else if (priceDelta < -10 && breadthDelta > 12) cur.divergence = "bullish";
+    }
+
+    return withOverlay;
   }, [history, range]);
+
+  // Identify weekend ranges (Saturday/Sunday in UTC) for shading
+  const weekendRanges = useMemo(() => {
+    if (!showWeekends || !visibleHistory.length) return [];
+    const ranges = [];
+    let weekendStart = null;
+    for (let i = 0; i < visibleHistory.length; i++) {
+      const d = new Date(visibleHistory[i].ts);
+      const day = d.getUTCDay(); // 0 Sun, 6 Sat
+      const isWeekend = day === 0 || day === 6;
+      if (isWeekend && weekendStart == null) {
+        weekendStart = visibleHistory[i].dateLabel;
+      } else if (!isWeekend && weekendStart != null) {
+        ranges.push({ x1: weekendStart, x2: visibleHistory[i - 1].dateLabel });
+        weekendStart = null;
+      }
+    }
+    if (weekendStart != null) ranges.push({ x1: weekendStart, x2: visibleHistory[visibleHistory.length - 1].dateLabel });
+    return ranges;
+  }, [visibleHistory, showWeekends]);
 
   const m = useMemo(() => {
     if (!coins.length) return null;
@@ -568,10 +681,10 @@ export default function App() {
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10, flexWrap:"wrap", gap:8 }}>
             <div>
               <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>
-                24h Breadth
+                24h Breadth{sectorFilter ? ` · ${sectorFilter}` : ""}
               </div>
               <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginTop:2 }}>
-                % of coins higher than 24h ago · real hourly closes from Bybit spot
+                % of coins higher than 24h ago · Bybit spot closes
               </div>
             </div>
             <div style={{ display:"flex", gap:4, alignItems:"center", flexWrap:"wrap" }}>
@@ -581,14 +694,61 @@ export default function App() {
             </div>
           </div>
 
+          {/* Sector filter pills */}
+          <div style={{ display:"flex", gap:4, marginBottom:10, flexWrap:"wrap" }}>
+            <button onClick={() => setSectorFilter(null)} style={{
+              background: sectorFilter === null ? P.textPri : "none",
+              border: `1px solid ${sectorFilter === null ? P.textPri : P.border}`,
+              color: sectorFilter === null ? "#fff" : P.textMuted,
+              padding:"3px 10px", cursor:"pointer", fontSize:10,
+              fontFamily:"DM Mono, monospace", borderRadius:4, transition:"all 0.15s",
+            }}>All</button>
+            {Object.keys(SECTOR_META).filter(s => s !== "Other").map(sec => {
+              const meta = SECTOR_META[sec];
+              const active = sectorFilter === sec;
+              return (
+                <button key={sec} onClick={() => setSectorFilter(active ? null : sec)} style={{
+                  background: active ? meta.color + "25" : "none",
+                  border: `1px solid ${active ? meta.color : P.border}`,
+                  color: active ? meta.color : P.textMuted,
+                  padding:"3px 10px", cursor:"pointer", fontSize:10,
+                  fontFamily:"DM Mono, monospace", borderRadius:4, transition:"all 0.15s",
+                }}>
+                  {sec}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Overlay toggles */}
+          <div style={{ display:"flex", gap:10, marginBottom:10, flexWrap:"wrap", padding:"6px 10px", background:P.surface2, borderRadius:6 }}>
+            <span style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>OVERLAYS:</span>
+            {[
+              { key:"weekends",   label:"Weekends",   state:showWeekends,  set:setShowWeekends,  col:P.textMuted },
+              { key:"btc",        label:"BTC",        state:showBTC,       set:setShowBTC,       col:P.amber },
+              { key:"eth",        label:"ETH",        state:showETH,       set:setShowETH,       col:P.blue },
+              { key:"divergence", label:"Divergence", state:showDivergence, set:setShowDivergence, col:P.red },
+              { key:"extremes",   label:"Extremes",   state:showExtremes,  set:setShowExtremes,  col:P.lavender },
+            ].map(t => (
+              <label key={t.key} style={{
+                display:"flex", alignItems:"center", gap:5, fontSize:10,
+                color: t.state ? t.col : P.textMuted,
+                fontFamily:"DM Mono, monospace", cursor:"pointer", userSelect:"none",
+              }}>
+                <input type="checkbox" checked={t.state} onChange={e => t.set(e.target.checked)} style={{ accentColor: t.col, cursor:"pointer" }}/>
+                {t.label}
+              </label>
+            ))}
+          </div>
+
           <div style={{ display:"flex", gap:14, marginBottom:6, flexWrap:"wrap" }}>
             {[["Bull >60%",P.green],["Neutral 40–60%",P.textMuted],["Bear <40%",P.red]].map(([lbl,col])=>(
               <div key={lbl} style={{ fontSize:9, color:col, fontFamily:"DM Mono, monospace" }}>— {lbl}</div>
             ))}
           </div>
 
-          <ResponsiveContainer width="100%" height={260}>
-            <AreaChart data={visibleHistory} margin={{ top:4, right:4, left:-24, bottom:0 }}>
+          <ResponsiveContainer width="100%" height={280}>
+            <ComposedChart data={visibleHistory} margin={{ top:4, right:4, left:-24, bottom:0 }}>
               <defs>
                 <linearGradient id="g24" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%"  stopColor={chartColor} stopOpacity={0.22}/>
@@ -599,16 +759,65 @@ export default function App() {
               <XAxis dataKey="dateLabel" tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={50}/>
               <YAxis domain={[0,100]} tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} tickFormatter={v=>`${v}%`}/>
               <Tooltip content={<CustomTooltip/>}/>
+
+              {/* Weekend shading */}
+              {showWeekends && weekendRanges.map((r, i) => (
+                <ReferenceArea key={`wk-${i}`} x1={r.x1} x2={r.x2} fill={P.textMuted} fillOpacity={0.07} ifOverflow="extendDomain"/>
+              ))}
+
+              {/* Regime lines */}
               <ReferenceLine y={60} stroke={`${P.green}55`}     strokeDasharray="4 4"/>
               <ReferenceLine y={50} stroke={`${P.textMuted}40`} strokeDasharray="2 4"/>
               <ReferenceLine y={40} stroke={`${P.red}55`}       strokeDasharray="4 4"/>
+              <ReferenceLine y={80} stroke={`${P.green}30`}     strokeDasharray="1 3"/>
+              <ReferenceLine y={20} stroke={`${P.red}30`}       strokeDasharray="1 3"/>
+
+              {/* Main breadth area */}
               <Area dataKey="mom24" name="24h Breadth" stroke={chartColor} fill="url(#g24)" strokeWidth={2} dot={false} connectNulls/>
-            </AreaChart>
+
+              {/* BTC overlay (normalised to 0-100) */}
+              {showBTC && (
+                <Line dataKey="btcNorm" name="BTC (normalised)" stroke={P.amber} strokeWidth={1.5} strokeDasharray="5 3" dot={false} connectNulls/>
+              )}
+
+              {/* ETH overlay (normalised to 0-100) */}
+              {showETH && (
+                <Line dataKey="ethNorm" name="ETH (normalised)" stroke={P.blue} strokeWidth={1.5} strokeDasharray="5 3" dot={false} connectNulls/>
+              )}
+
+              {/* Extreme markers */}
+              {showExtremes && visibleHistory.filter(p => p.extreme).map((p, i) => (
+                <ReferenceDot
+                  key={`ext-${i}`}
+                  x={p.dateLabel}
+                  y={p.mom24}
+                  r={3}
+                  fill={p.extreme === "high" ? P.green : P.red}
+                  stroke="#fff"
+                  strokeWidth={1}
+                  ifOverflow="extendDomain"
+                />
+              ))}
+
+              {/* Divergence markers */}
+              {showDivergence && visibleHistory.filter(p => p.divergence).map((p, i) => (
+                <ReferenceDot
+                  key={`div-${i}`}
+                  x={p.dateLabel}
+                  y={p.mom24}
+                  r={5}
+                  fill={p.divergence === "bearish" ? P.red : P.green}
+                  stroke="#fff"
+                  strokeWidth={2}
+                  ifOverflow="extendDomain"
+                />
+              ))}
+            </ComposedChart>
           </ResponsiveContainer>
 
           {visibleHistory.length === 0 && (
             <div style={{ textAlign:"center", padding:"40px 0", color:P.textMuted, fontSize:11, fontFamily:"DM Mono, monospace" }}>
-              {bootstrapping ? "Fetching Bybit data…" : "No data for this range yet"}
+              {bootstrapping ? "Fetching Bybit data…" : sectorFilter ? `Not enough coins in ${sectorFilter} sector with Bybit data` : "No data for this range yet"}
             </div>
           )}
         </div>
