@@ -15,7 +15,7 @@ const P = {
   lavender:"#8b7fba", teal:"#4a9e9e",
 };
 
-const STORAGE_KEY  = "cbt_v8";
+const STORAGE_KEY  = "cbt_v9";
 const MIN_HOUR_GAP = 15 * 60 * 1000;  // 15 min — captures intraday oscillation
 const MAX_POINTS   = 8640;             // 90 days × 96 points/day (at 15 min intervals)
 
@@ -251,11 +251,13 @@ const SectorRow = ({ name, pct, adv, total }) => {
   );
 };
 
-const CustomTooltip = ({ active, payload, label }) => {
+const CustomTooltip = ({ active, payload }) => {
   if (!active || !payload?.length) return null;
+  // Use the original data point's `label` field which includes date + time
+  const fullLabel = payload[0]?.payload?.label ?? "";
   return (
     <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:8, padding:"10px 14px", fontSize:11, fontFamily:"DM Mono, monospace", boxShadow:"0 4px 20px rgba(0,0,0,0.08)" }}>
-      <div style={{ color:P.textMuted, marginBottom:6, fontSize:10 }}>{label}</div>
+      <div style={{ color:P.textMuted, marginBottom:6, fontSize:10 }}>{fullLabel}</div>
       {payload.map(p => <div key={p.dataKey} style={{ color:p.color||P.textSec, marginBottom:3 }}>{p.name}: {p.value != null ? `${p.value}%` : "—"}</div>)}
     </div>
   );
@@ -366,35 +368,13 @@ export default function App() {
     return () => clearInterval(id);
   }, [fetchData]);
 
-  // Bootstrap 90-day history in background (runs once, after first render)
+  // Bootstrap disabled — the daily market_chart endpoint produces bad data
+  // when rate-limited (too few coins = extreme 0/100 spikes). Real data now
+  // comes purely from sparkline (7d immediate) + 15-min accumulation onwards.
   useEffect(() => {
     if (didBoot.current) return;
     didBoot.current = true;
-    const stored = loadHistory();
-    // Skip bootstrap if we already have >30 days of data
-    if (stored && stored.some(p => p.src === "bootstrap")) return;
-
-    setBooting(true);
-    setBootStatus("Fetching 90-day daily history…");
-    fetchBootstrap(pct => {
-      setBootPct(pct);
-      setBootStatus(`${pct}% — building daily history`);
-    }).then(pts => {
-      console.log(`[Bootstrap] Got ${pts.length} daily points`);
-      if (pts.length > 0) {
-        setHistory(prev => {
-          const merged = [...pts, ...prev.filter(p => p.src !== "bootstrap")]
-            .sort((a, b) => a.ts - b.ts)
-            .slice(-MAX_POINTS);
-          saveHistory(merged);
-          return merged;
-        });
-        setBootStatus(`Done — ${pts.length} daily points added`);
-      } else {
-        setBootStatus("Daily bootstrap unavailable — using sparkline data");
-      }
-      setBooting(false);
-    });
+    // no-op
   }, []);
 
   const visibleHistory = useMemo(() => {
@@ -542,7 +522,7 @@ export default function App() {
               <CartesianGrid strokeDasharray="3 3" stroke={P.border2} vertical={false}/>
               <XAxis dataKey="dateLabel" tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={50}/>
               <YAxis domain={[0,100]} tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} tickFormatter={v=>`${v}%`}/>
-              <Tooltip content={<CustomTooltip/>} labelKey="label"/>
+              <Tooltip content={<CustomTooltip/>}/>
               <ReferenceLine y={60} stroke={`${P.green}55`}     strokeDasharray="4 4"/>
               <ReferenceLine y={50} stroke={`${P.textMuted}40`} strokeDasharray="2 4"/>
               <ReferenceLine y={40} stroke={`${P.red}55`}       strokeDasharray="4 4"/>
