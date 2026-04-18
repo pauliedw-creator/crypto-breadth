@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, ReferenceLine,
@@ -31,9 +31,9 @@ const P = {
 // ─────────────────────────────────────────────
 //  CONSTANTS
 // ─────────────────────────────────────────────
-const STORAGE_KEY   = "cbt_hourly_v5";
-const MIN_HOUR_GAP  = 50 * 60 * 1000; // 50 min in ms — one point per hour
-const MAX_POINTS    = 2160;            // 90 days × 24h
+const STORAGE_KEY  = "cbt_v6";
+const MIN_HOUR_GAP = 50 * 60 * 1000;
+const MAX_POINTS   = 2160; // 90 days × 24h
 
 const EXCLUDE = new Set([
   "USDT","USDC","BUSD","DAI","TUSD","USDP","GUSD","FRAX","LUSD","SUSD",
@@ -48,15 +48,12 @@ const SECTOR_MAP = {
   ATOM:"L1",NEAR:"L1",ALGO:"L1",ICP:"L1",SUI:"L1",APT:"L1",TON:"L1",
   SEI:"L1",FTM:"L1",EGLD:"L1",HBAR:"L1",XLM:"L1",TRX:"L1",VET:"L1",
   XRP:"L1",LTC:"L1",BCH:"L1",ETC:"L1",KAS:"L1",
-  MATIC:"L2",ARB:"L2",OP:"L2",IMX:"L2",STRK:"L2",ZK:"L2",METIS:"L2",
-  MANTA:"L2",BLAST:"L2",SCROLL:"L2",
+  MATIC:"L2",ARB:"L2",OP:"L2",IMX:"L2",STRK:"L2",ZK:"L2",
   UNI:"DeFi",AAVE:"DeFi",MKR:"DeFi",CRV:"DeFi",SNX:"DeFi",COMP:"DeFi",
   LDO:"DeFi",BAL:"DeFi",PENDLE:"DeFi",GMX:"DeFi",DYDX:"DeFi",CAKE:"DeFi",
   JUP:"DeFi",RAY:"DeFi",SUSHI:"DeFi",OSMO:"DeFi",KAVA:"DeFi",
-  FET:"AI",AGIX:"AI",OCEAN:"AI",RNDR:"AI",RENDER:"AI",WLD:"AI",AKT:"AI",
-  GRT:"AI",NMR:"AI",TAO:"AI",
+  FET:"AI",AGIX:"AI",OCEAN:"AI",RNDR:"AI",RENDER:"AI",WLD:"AI",GRT:"AI",TAO:"AI",
   DOGE:"Meme",SHIB:"Meme",PEPE:"Meme",BONK:"Meme",WIF:"Meme",FLOKI:"Meme",
-  BRETT:"Meme",TURBO:"Meme",MOG:"Meme",POPCAT:"Meme",
   AXS:"Gaming",SAND:"Gaming",MANA:"Gaming",GALA:"Gaming",RON:"Gaming",
 };
 
@@ -86,102 +83,23 @@ const PCT_KEY = {
 };
 
 const RANGE_OPTIONS = [
-  { label: "7d",   hours: 168  },
-  { label: "30d",  hours: 720  },
-  { label: "90d",  hours: 2160 },
+  { label:"7d",  hours: 168  },
+  { label:"30d", hours: 720  },
+  { label:"90d", hours: 2160 },
 ];
 
-// ─────────────────────────────────────────────
-//  REAL HISTORY from sparkline (7 days, hourly closes per coin)
-// ─────────────────────────────────────────────
-const computeSparklineBreadth = (coins) => {
-  const sparklines = coins
-    .map(c => c.sparkline_in_7d?.price)
-    .filter(arr => Array.isArray(arr) && arr.length >= 48);
-
-  if (sparklines.length < 20) return [];
-
-  const len = Math.min(...sparklines.map(a => a.length));
-  const now = Date.now();
-  const points = [];
-
-  for (let i = 1; i < len; i++) {
-    const adv1h  = sparklines.filter(arr => arr[i] > arr[i - 1]).length;
-    const b1h    = Math.round(adv1h / sparklines.length * 100);
-    const adv24h = i >= 24 ? sparklines.filter(arr => arr[i] > arr[i - 24]).length : null;
-    const b24h   = adv24h != null ? Math.round(adv24h / sparklines.length * 100) : null;
-    const ts     = now - (len - i) * 60 * 60 * 1000;
-    const d      = new Date(ts);
-    points.push({
-      ts,
-      label:     d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
-                 d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      dateLabel: d.toLocaleDateString([], { month: 'short', day: 'numeric' }),
-      b1h, b24h, b7d: null, seeded: false, real: true,
-    });
-  }
-  return points;
-};
-
-// ─────────────────────────────────────────────
-//  SYNTHETIC history for 30d/90d context
-//  Anchored to oldest real point so the join is smooth
-// ─────────────────────────────────────────────
-const buildSyntheticHistory = (anchorB1h, hoursBack) => {
-  const now    = Date.now();
-  const total  = hoursBack;
-  const phases = [
-    { centre: 18, len: 0.14 },
-    { centre: 32, len: 0.10 },
-    { centre: 68, len: 0.16 },
-    { centre: 86, len: 0.18 },
-    { centre: 60, len: 0.10 },
-    { centre: 80, len: 0.14 },
-    { centre: 28, len: 0.18 },
-  ];
-  const baseline = new Float32Array(total);
-  let pos = 0;
-  for (const ph of phases) {
-    const len = Math.round(ph.len * total);
-    for (let j = 0; j < len && pos + j < total; j++) baseline[pos + j] = ph.centre;
-    pos += len;
-  }
-  for (let i = pos; i < total; i++) baseline[i] = anchorB1h;
-
-  const smoothed = new Float32Array(total);
-  const win = 72;
-  for (let i = 0; i < total; i++) {
-    let sum = 0, cnt = 0;
-    for (let j = Math.max(0, i - win); j <= Math.min(total - 1, i + win); j++) {
-      sum += baseline[j]; cnt++;
-    }
-    smoothed[i] = sum / cnt;
-  }
-  // Ease the tail into anchorB1h so the join with real data is seamless
-  const tailLen = 72;
-  for (let i = total - tailLen; i < total; i++) {
-    const t = (i - (total - tailLen)) / tailLen;
-    smoothed[i] = smoothed[i] * (1 - t) + anchorB1h * t;
-  }
-
-  const points = [];
-  for (let i = 0; i < total; i++) {
-    const base  = smoothed[i];
-    const frac  = i / total;
-    const b1    = Math.max(5,  Math.min(95, base + Math.sin(frac * Math.PI * 45) * 15 + Math.sin(frac * Math.PI * 180) * 9 + (Math.random() - 0.5) * 10));
-    const b24   = Math.max(8,  Math.min(92, base + (Math.random() - 0.5) * 6));
-    const ts    = now - (7 * 24 + total - i) * 60 * 60 * 1000;
-    const d     = new Date(ts);
-    points.push({
-      ts,
-      label:     d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
-                 d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      dateLabel: d.toLocaleDateString([], { month: 'short', day: 'numeric' }),
-      b1h: Math.round(b1), b24h: Math.round(b24), b7d: null, seeded: true, real: false,
-    });
-  }
-  return points;
-};
+// Bootstrap coin IDs: top 50 reliable coins for daily history fetch
+const BOOTSTRAP_IDS = [
+  "bitcoin","ethereum","binancecoin","solana","ripple","cardano","avalanche-2",
+  "polkadot","near","algorand","internet-computer","sui","aptos","toncoin",
+  "stellar","tron","vechain","litecoin","bitcoin-cash","ethereum-classic",
+  "uniswap","aave","maker","curve-dao-token","synthetix-network-token",
+  "compound-governance-token","lido-dao","gmx","dydx","jupiter",
+  "fetch-ai","ocean-protocol","render-token","worldcoin-wld","the-graph",
+  "dogecoin","shiba-inu","pepe","bonk","dogwifcoin",
+  "axie-infinity","the-sandbox","decentraland","gala","ronin",
+  "arbitrum","optimism","immutable-x","matic-network","cosmos",
+];
 
 // ─────────────────────────────────────────────
 //  HELPERS
@@ -235,6 +153,8 @@ const fmtPrice = n => {
   return `$${n.toFixed(6)}`;
 };
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 // ─────────────────────────────────────────────
 //  STORAGE
 // ─────────────────────────────────────────────
@@ -245,10 +165,78 @@ const loadHistory = () => {
   } catch { return null; }
 };
 
-const saveHistory = (pts) => {
+const saveHistory = pts => {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(pts.slice(-MAX_POINTS)));
   } catch {}
+};
+
+// ─────────────────────────────────────────────
+//  BOOTSTRAP: fetch 90-day daily history per coin
+//  Computes real daily 24h breadth from actual closes
+// ─────────────────────────────────────────────
+const fetchBootstrapHistory = async (onProgress) => {
+  const priceHistory = {}; // coinId -> [{ ts, price }]
+  let done = 0;
+
+  for (const id of BOOTSTRAP_IDS) {
+    try {
+      const res = await fetch(
+        `https://api.coingecko.com/api/v3/coins/${id}/market_chart` +
+        `?vs_currency=usd&days=90&interval=daily`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.prices?.length > 0) {
+          priceHistory[id] = data.prices; // [[timestamp_ms, price], ...]
+        }
+      }
+    } catch {}
+    done++;
+    onProgress(Math.round(done / BOOTSTRAP_IDS.length * 100));
+    await sleep(2200); // ~27 calls/min — safely under the 30/min free tier limit
+  }
+
+  // Align all coins to a common set of daily timestamps
+  // Find the coin with the most data points as reference
+  const allSeries = Object.values(priceHistory);
+  if (allSeries.length < 10) return [];
+
+  // Get reference timestamps from bitcoin (or first available)
+  const refSeries = priceHistory["bitcoin"] || allSeries[0];
+  const points = [];
+
+  for (let i = 1; i < refSeries.length; i++) {
+    const ts      = refSeries[i][0];
+    const prevTs  = refSeries[i - 1][0];
+    let adv = 0, total = 0;
+
+    for (const series of allSeries) {
+      // Find closest price at ts and prevTs
+      const cur  = series.find(p => Math.abs(p[0] - ts) < 36 * 3600 * 1000);
+      const prev = series.find(p => Math.abs(p[0] - prevTs) < 36 * 3600 * 1000);
+      if (cur && prev && prev[1] > 0) {
+        total++;
+        if (cur[1] > prev[1]) adv++;
+      }
+    }
+
+    if (total >= 10) {
+      const d = new Date(ts);
+      points.push({
+        ts,
+        label:     d.toLocaleDateString([], { month: "short", day: "numeric" }),
+        dateLabel: d.toLocaleDateString([], { month: "short", day: "numeric" }),
+        b24h:  Math.round(adv / total * 100),
+        b7d:   null,
+        seeded: false,
+        real:  true,
+        daily: true,
+      });
+    }
+  }
+
+  return points.sort((a, b) => a.ts - b.ts);
 };
 
 // ─────────────────────────────────────────────
@@ -270,7 +258,7 @@ const MetricCard = ({ label, value, sub, pct }) => {
         {value ?? "—"}
       </div>
       {sub && (
-        <div style={{ display: "inline-block", marginTop: 8, fontSize: 10, color: col, background: bg, padding: "2px 8px", borderRadius: 20, fontFamily: "DM Mono, monospace" }}>
+        <div style={{ display:"inline-block", marginTop:8, fontSize:10, color:col, background:bg, padding:"2px 8px", borderRadius:20, fontFamily:"DM Mono, monospace" }}>
           {sub}
         </div>
       )}
@@ -283,20 +271,20 @@ const SectorRow = ({ name, pct, adv, total }) => {
   const c    = breadthColor(pct);
   return (
     <div style={{ marginBottom: 12 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5, alignItems: "center" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <div style={{ width: 7, height: 7, borderRadius: "50%", background: meta.color }}/>
-          <span style={{ fontSize: 11, color: P.textSec, fontFamily: "DM Mono, monospace" }}>{name}</span>
+      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:5, alignItems:"center" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+          <div style={{ width:7, height:7, borderRadius:"50%", background:meta.color }}/>
+          <span style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace" }}>{name}</span>
         </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <span style={{ fontSize: 10, color: P.textMuted }}>{adv}/{total}</span>
-          <span style={{ fontSize: 12, color: c, fontFamily: "DM Mono, monospace", fontWeight: 600, background: breadthBg(pct), padding: "1px 8px", borderRadius: 10 }}>
+        <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+          <span style={{ fontSize:10, color:P.textMuted }}>{adv}/{total}</span>
+          <span style={{ fontSize:12, color:c, fontFamily:"DM Mono, monospace", fontWeight:600, background:breadthBg(pct), padding:"1px 8px", borderRadius:10 }}>
             {pct}%
           </span>
         </div>
       </div>
-      <div style={{ height: 4, background: P.border, borderRadius: 2, overflow: "hidden" }}>
-        <div style={{ height: "100%", width: `${pct}%`, background: `linear-gradient(90deg, ${c}80, ${c})`, borderRadius: 2, transition: "width 1s ease" }}/>
+      <div style={{ height:4, background:P.border, borderRadius:2, overflow:"hidden" }}>
+        <div style={{ height:"100%", width:`${pct}%`, background:`linear-gradient(90deg, ${c}80, ${c})`, borderRadius:2, transition:"width 1s ease" }}/>
       </div>
     </div>
   );
@@ -305,14 +293,10 @@ const SectorRow = ({ name, pct, adv, total }) => {
 const CustomTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   return (
-    <div style={{
-      background: P.surface, border: `1px solid ${P.border}`,
-      borderRadius: 8, padding: "10px 14px", fontSize: 11,
-      fontFamily: "DM Mono, monospace", boxShadow: "0 4px 20px rgba(0,0,0,0.08)",
-    }}>
-      <div style={{ color: P.textMuted, marginBottom: 6, fontSize: 10 }}>{label}</div>
+    <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:8, padding:"10px 14px", fontSize:11, fontFamily:"DM Mono, monospace", boxShadow:"0 4px 20px rgba(0,0,0,0.08)" }}>
+      <div style={{ color:P.textMuted, marginBottom:6, fontSize:10 }}>{label}</div>
       {payload.map(p => (
-        <div key={p.dataKey} style={{ color: p.color || P.textSec, marginBottom: 3 }}>
+        <div key={p.dataKey} style={{ color:p.color||P.textSec, marginBottom:3 }}>
           {p.name}: {p.value != null ? `${p.value}%` : "—"}
         </div>
       ))}
@@ -326,30 +310,26 @@ const CoinRow = ({ c, rank, even }) => {
   const p7  = c[PCT_KEY["7d"]];
   const p30 = c[PCT_KEY["30d"]];
   const pill = v => ({
-    padding: "2px 8px", borderRadius: 10, fontSize: 10,
-    fontFamily: "DM Mono, monospace",
-    color:      breadthColor(v > 0 ? 70 : v < 0 ? 30 : 50),
-    background: breadthBg(v > 0 ? 70 : v < 0 ? 30 : 50),
-    whiteSpace: "nowrap", display: "inline-block",
+    padding:"2px 8px", borderRadius:10, fontSize:10, fontFamily:"DM Mono, monospace",
+    color:breadthColor(v>0?70:v<0?30:50), background:breadthBg(v>0?70:v<0?30:50),
+    whiteSpace:"nowrap", display:"inline-block",
   });
-  const TD = ({ val, align = "right", style = {} }) => (
-    <td style={{ padding: "7px 10px", fontSize: 11, textAlign: align, borderBottom: `1px solid ${P.border2}`, verticalAlign: "middle", ...style }}>
-      {val}
-    </td>
+  const TD = ({ val, align="right", style={} }) => (
+    <td style={{ padding:"7px 10px", fontSize:11, textAlign:align, borderBottom:`1px solid ${P.border2}`, verticalAlign:"middle", ...style }}>{val}</td>
   );
   return (
     <tr style={{ background: even ? P.surface2 : P.surface }}>
-      <TD val={<span style={{ color: P.textMuted, fontSize: 10, fontFamily: "DM Mono, monospace" }}>{rank}</span>}/>
+      <TD val={<span style={{ color:P.textMuted, fontSize:10, fontFamily:"DM Mono, monospace" }}>{rank}</span>}/>
       <TD align="left" val={
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {c.image && <img src={c.image} alt="" style={{ width: 20, height: 20, borderRadius: "50%" }}/>}
-          <span style={{ color: P.textPri, fontWeight: 500, fontSize: 12, fontFamily: "DM Mono, monospace" }}>{c.symbol.toUpperCase()}</span>
-          <span style={{ color: P.textMuted, fontSize: 10 }}>{c.name}</span>
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          {c.image && <img src={c.image} alt="" style={{ width:20, height:20, borderRadius:"50%" }}/>}
+          <span style={{ color:P.textPri, fontWeight:500, fontSize:12, fontFamily:"DM Mono, monospace" }}>{c.symbol.toUpperCase()}</span>
+          <span style={{ color:P.textMuted, fontSize:10 }}>{c.name}</span>
         </div>
       }/>
-      <TD val={<span style={{ color: P.textSec, fontFamily: "DM Mono, monospace" }}>{fmtPrice(c.current_price)}</span>}/>
-      <TD val={<span style={{ color: P.textMuted, fontFamily: "DM Mono, monospace", fontSize: 10 }}>{fmtLarge(c.market_cap)}</span>}/>
-      <TD val={<span style={{ color: P.textMuted, fontFamily: "DM Mono, monospace", fontSize: 10 }}>{fmtLarge(c.total_volume)}</span>}/>
+      <TD val={<span style={{ color:P.textSec, fontFamily:"DM Mono, monospace" }}>{fmtPrice(c.current_price)}</span>}/>
+      <TD val={<span style={{ color:P.textMuted, fontFamily:"DM Mono, monospace", fontSize:10 }}>{fmtLarge(c.market_cap)}</span>}/>
+      <TD val={<span style={{ color:P.textMuted, fontFamily:"DM Mono, monospace", fontSize:10 }}>{fmtLarge(c.total_volume)}</span>}/>
       <TD val={<span style={pill(p1)}>{fmtPct(p1)}</span>}/>
       <TD val={<span style={pill(p24)}>{fmtPct(p24)}</span>}/>
       <TD val={<span style={pill(p7)}>{fmtPct(p7)}</span>}/>
@@ -362,16 +342,19 @@ const CoinRow = ({ c, rank, even }) => {
 //  MAIN
 // ─────────────────────────────────────────────
 export default function CryptoBreadthTerminal() {
-  const [coins, setCoins]           = useState([]);
-  const [loading, setLoading]       = useState(true);
-  const [error, setError]           = useState(null);
-  const [lastUpdate, setLastUpdate] = useState(null);
-  const [history, setHistory]       = useState([]);
-  const [refreshing, setRefreshing] = useState(false);
-  const [search, setSearch]         = useState("");
-  const [sortKey, setSortKey]       = useState("market_cap");
-  const [sortDir, setSortDir]       = useState("desc");
-  const [range, setRange]           = useState(720); // default 30d
+  const [coins, setCoins]             = useState([]);
+  const [loading, setLoading]         = useState(true);
+  const [error, setError]             = useState(null);
+  const [lastUpdate, setLastUpdate]   = useState(null);
+  const [history, setHistory]         = useState([]);
+  const [refreshing, setRefreshing]   = useState(false);
+  const [bootstrapping, setBootstrapping] = useState(false);
+  const [bootProgress, setBootProgress]   = useState(0);
+  const [search, setSearch]           = useState("");
+  const [sortKey, setSortKey]         = useState("market_cap");
+  const [sortDir, setSortDir]         = useState("desc");
+  const [range, setRange]             = useState(720);
+  const bootstrapRan = useRef(false);
 
   useEffect(() => {
     const link = document.createElement("link");
@@ -381,13 +364,33 @@ export default function CryptoBreadthTerminal() {
     return () => document.head.removeChild(link);
   }, []);
 
+  // Bootstrap on first ever load (no stored history)
+  useEffect(() => {
+    if (bootstrapRan.current) return;
+    bootstrapRan.current = true;
+    const stored = loadHistory();
+    if (stored && stored.length > 10) {
+      setHistory(stored);
+      return;
+    }
+    // No history — run bootstrap
+    setBootstrapping(true);
+    fetchBootstrapHistory(pct => setBootProgress(pct)).then(pts => {
+      if (pts.length > 0) {
+        saveHistory(pts);
+        setHistory(pts);
+      }
+      setBootstrapping(false);
+    });
+  }, []);
+
   const fetchData = useCallback(async () => {
     setRefreshing(true);
     try {
       const res = await fetch(
         "https://api.coingecko.com/api/v3/coins/markets" +
         "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1" +
-        "&sparkline=true&price_change_percentage=1h,24h,7d,30d"
+        "&sparkline=false&price_change_percentage=1h,24h,7d,30d"
       );
       if (!res.ok) {
         if (res.status === 429) throw new Error("Rate limited — retrying shortly");
@@ -403,54 +406,27 @@ export default function CryptoBreadthTerminal() {
 
       const b24 = calcBreadth(filtered, "24h");
       const b7  = calcBreadth(filtered, "7d");
-      const b1  = calcBreadth(filtered, "1h");
+
+      if (b24 == null) return;
 
       setHistory(prev => {
-        // Load from localStorage first
-        let stored = prev.length > 0 ? prev : (loadHistory() || []);
-
-        // Compute real 7-day hourly breadth from sparkline data
-        const realPts = computeSparklineBreadth(filtered);
-
-        // If we have real sparkline points, use them as the authoritative 7-day window
-        // Merge: keep synthetic history older than 7 days, replace last 7 days with real data
-        let base;
-        if (realPts.length > 0) {
-          const cutoff7d = Date.now() - 7 * 24 * 60 * 60 * 1000;
-          const oldSynthetic = stored.filter(p => p.ts < cutoff7d && p.seeded);
-
-          // Build synthetic pre-history if we don't have enough
-          if (oldSynthetic.length < 100) {
-            const anchorB1h = realPts[0]?.b1h ?? 50;
-            const synthetic = buildSyntheticHistory(anchorB1h, 83 * 24); // 83 days before the 7d window
-            base = [...synthetic, ...realPts];
-          } else {
-            base = [...oldSynthetic, ...realPts];
-          }
-        } else {
-          // Sparkline unavailable — fall back to stored or empty
-          base = stored.length > 0 ? stored : [];
-        }
-
-        // Append current live point hourly
-        const lastReal = [...base].reverse().find(p => p.real);
+        const base = prev.length > 0 ? prev : (loadHistory() || []);
+        // Append a new real point once per hour
+        const lastReal = [...base].reverse().find(p => p.real && !p.daily);
         const now      = Date.now();
-        const shouldAppend = !lastReal || (now - lastReal.ts) >= MIN_HOUR_GAP;
+        if (lastReal && (now - lastReal.ts) < MIN_HOUR_GAP) return base;
 
-        if (shouldAppend && b24 != null) {
-          const d     = new Date(now);
-          const point = {
-            ts: now,
-            label:     d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " +
-                       d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-            dateLabel: d.toLocaleDateString([], { month: "short", day: "numeric" }),
-            b1h: b1, b24h: b24, b7d: b7, seeded: false, real: true,
-          };
-          base = [...base.slice(-MAX_POINTS + 1), point];
-        }
-
-        saveHistory(base.filter(p => p.real)); // only persist real points
-        return base;
+        const d     = new Date(now);
+        const point = {
+          ts: now,
+          label:     d.toLocaleDateString([], { month:"short", day:"numeric" }) + " " +
+                     d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" }),
+          dateLabel: d.toLocaleDateString([], { month:"short", day:"numeric" }),
+          b24h: b24, b7d: b7, seeded: false, real: true, daily: false,
+        };
+        const updated = [...base.slice(-MAX_POINTS + 1), point];
+        saveHistory(updated);
+        return updated;
       });
     } catch (e) {
       setError(e.message);
@@ -466,13 +442,10 @@ export default function CryptoBreadthTerminal() {
     return () => clearInterval(id);
   }, [fetchData]);
 
-  // Slice history to selected range
   const visibleHistory = useMemo(() => {
     if (!history.length) return [];
     const cutoff = Date.now() - range * 60 * 60 * 1000;
     const pts    = history.filter(p => p.ts >= cutoff);
-
-    // Thin out points so chart isn't over-dense (max ~300 visible points)
     const maxPts = 300;
     if (pts.length <= maxPts) return pts;
     const step = Math.ceil(pts.length / maxPts);
@@ -494,14 +467,13 @@ export default function CryptoBreadthTerminal() {
     const secMap = {};
     coins.forEach(c => {
       const s = SECTOR_MAP[c.symbol?.toUpperCase()] || "Other";
-      if (!secMap[s]) secMap[s] = { adv: 0, total: 0 };
+      if (!secMap[s]) secMap[s] = { adv:0, total:0 };
       secMap[s].total++;
       if ((c[k24] ?? c.price_change_percentage_24h ?? 0) > 0) secMap[s].adv++;
     });
     const sectors = Object.entries(secMap)
-      .map(([name, d]) => ({ name, pct: Math.round(d.adv / d.total * 100), adv: d.adv, total: d.total }))
+      .map(([name, d]) => ({ name, pct:Math.round(d.adv/d.total*100), adv:d.adv, total:d.total }))
       .sort((a, b) => b.total - a.total);
-
     const sorted = [...coins].filter(c => c[k24] != null).sort((a, b) => b[k24] - a[k24]);
 
     return {
@@ -514,9 +486,9 @@ export default function CryptoBreadthTerminal() {
   }, [coins]);
 
   const thrustAlert = useMemo(() => {
-    const real = history.filter(p => !p.seeded).slice(-10);
+    const real = history.filter(p => p.real).slice(-10);
     if (real.length < 3) return false;
-    return real.some(p => p.b1h != null && p.b1h < 40) && (real.at(-1)?.b1h ?? 0) > 60;
+    return real.some(p => p.b24h < 40) && (real.at(-1)?.b24h ?? 0) > 60;
   }, [history]);
 
   const tableCoins = useMemo(() => {
@@ -537,85 +509,101 @@ export default function CryptoBreadthTerminal() {
     else { setSortKey(key); setSortDir("desc"); }
   };
 
-  const realPointCount = history.filter(p => !p.seeded).length;
+  const chartColor = breadthColor(m?.b24);
+  const realCount  = history.filter(p => p.real).length;
 
-  if (loading) return (
-    <div style={{ background: P.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "DM Sans, sans-serif" }}>
-      <div style={{ textAlign: "center" }}>
-        <div style={{ fontSize: 22, fontWeight: 600, color: P.green, marginBottom: 8 }}>Crypto Breadth Terminal</div>
-        <div style={{ color: P.textMuted, fontSize: 12 }}>Loading market data…</div>
-        <div style={{ width: 200, height: 3, background: P.border, margin: "18px auto 0", borderRadius: 2, overflow: "hidden" }}>
-          <div style={{ height: "100%", background: P.green, animation: "slide 1.5s ease-in-out infinite" }}/>
+  // ─── Bootstrap screen ───
+  if (bootstrapping) return (
+    <div style={{ background:P.bg, minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"DM Sans, sans-serif" }}>
+      <div style={{ textAlign:"center", maxWidth:380 }}>
+        <div style={{ fontSize:20, fontWeight:600, color:P.textPri, marginBottom:8 }}>Crypto Breadth Terminal</div>
+        <div style={{ fontSize:13, color:P.textSec, marginBottom:6 }}>Building 90-day history…</div>
+        <div style={{ fontSize:11, color:P.textMuted, marginBottom:20, lineHeight:1.6 }}>
+          Fetching real daily price data for {BOOTSTRAP_IDS.length} coins.<br/>
+          This runs once and takes ~2 minutes. Please leave the tab open.
+        </div>
+        <div style={{ width:"100%", height:8, background:P.border, borderRadius:4, overflow:"hidden", marginBottom:10 }}>
+          <div style={{ height:"100%", width:`${bootProgress}%`, background:P.green, borderRadius:4, transition:"width 0.4s ease" }}/>
+        </div>
+        <div style={{ fontSize:11, color:P.green, fontFamily:"DM Mono, monospace" }}>
+          {bootProgress}% — {Math.round(bootProgress / 100 * BOOTSTRAP_IDS.length)} / {BOOTSTRAP_IDS.length} coins
+        </div>
+      </div>
+    </div>
+  );
+
+  // ─── Loading screen ───
+  if (loading && !history.length) return (
+    <div style={{ background:P.bg, minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"DM Sans, sans-serif" }}>
+      <div style={{ textAlign:"center" }}>
+        <div style={{ fontSize:22, fontWeight:600, color:P.green, marginBottom:8 }}>Crypto Breadth Terminal</div>
+        <div style={{ color:P.textMuted, fontSize:12 }}>Loading market data…</div>
+        <div style={{ width:200, height:3, background:P.border, margin:"18px auto 0", borderRadius:2, overflow:"hidden" }}>
+          <div style={{ height:"100%", background:P.green, animation:"slide 1.5s ease-in-out infinite" }}/>
         </div>
       </div>
       <style>{`@keyframes slide{0%{width:0;margin-left:0}50%{width:100%;margin-left:0}100%{width:0;margin-left:100%}}`}</style>
     </div>
   );
 
-  const TH = ({ label, sortK, align = "right" }) => (
+  const TH = ({ label, sortK, align="right" }) => (
     <th onClick={() => toggleSort(sortK)} style={{
-      padding: "8px 10px", fontSize: 9, letterSpacing: 1.5, textTransform: "uppercase",
-      color: sortKey === sortK ? P.green : P.textMuted,
-      textAlign: align, cursor: "pointer", userSelect: "none", whiteSpace: "nowrap",
-      fontFamily: "DM Mono, monospace", fontWeight: 400,
-      borderBottom: `2px solid ${P.border}`, background: P.surface2,
+      padding:"8px 10px", fontSize:9, letterSpacing:1.5, textTransform:"uppercase",
+      color: sortKey===sortK ? P.green : P.textMuted,
+      textAlign:align, cursor:"pointer", userSelect:"none", whiteSpace:"nowrap",
+      fontFamily:"DM Mono, monospace", fontWeight:400,
+      borderBottom:`2px solid ${P.border}`, background:P.surface2,
     }}>
-      {label}{sortKey === sortK ? (sortDir === "desc" ? " ↓" : " ↑") : ""}
+      {label}{sortKey===sortK ? (sortDir==="desc" ? " ↓" : " ↑") : ""}
     </th>
   );
 
-  const chartColor = breadthColor(m?.b24);
-
   return (
-    <div style={{ background: P.bg, minHeight: "100vh", color: P.textPri, padding: "16px 20px", fontFamily: "DM Sans, sans-serif" }}>
+    <div style={{ background:P.bg, minHeight:"100vh", color:P.textPri, padding:"16px 20px", fontFamily:"DM Sans, sans-serif" }}>
       <style>{`
         * { box-sizing: border-box; }
-        ::-webkit-scrollbar { width: 5px; height: 5px; }
-        ::-webkit-scrollbar-track { background: ${P.surface2}; }
-        ::-webkit-scrollbar-thumb { background: ${P.border}; border-radius: 3px; }
+        ::-webkit-scrollbar { width:5px; height:5px; }
+        ::-webkit-scrollbar-track { background:${P.surface2}; }
+        ::-webkit-scrollbar-thumb { background:${P.border}; border-radius:3px; }
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
         @keyframes slide { 0%{width:0;margin-left:0} 50%{width:100%;margin-left:0} 100%{width:0;margin-left:100%} }
       `}</style>
 
       {/* HEADER */}
-      <div style={{
-        display: "flex", alignItems: "center", justifyContent: "space-between",
-        marginBottom: 20, paddingBottom: 14, borderBottom: `1px solid ${P.border}`,
-        flexWrap: "wrap", gap: 10,
-      }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:20, paddingBottom:14, borderBottom:`1px solid ${P.border}`, flexWrap:"wrap", gap:10 }}>
         <div>
-          <div style={{ fontSize: 18, fontWeight: 600, color: P.textPri }}>Crypto Breadth Terminal</div>
-          <div style={{ fontSize: 10, color: P.textMuted, marginTop: 3, fontFamily: "DM Mono, monospace", letterSpacing: 1 }}>
-            {coins.length} coins · stables & wrapped excluded · {realPointCount} live hourly readings recorded
+          <div style={{ fontSize:18, fontWeight:600, color:P.textPri }}>Crypto Breadth Terminal</div>
+          <div style={{ fontSize:10, color:P.textMuted, marginTop:3, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>
+            {coins.length} coins · {realCount} real data points · 90-day daily history
           </div>
         </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
           {thrustAlert && (
-            <div style={{ padding: "4px 12px", background: P.amberPale, border: `1px solid ${P.amber}50`, borderRadius: 20, fontSize: 10, color: P.amber, fontFamily: "DM Mono, monospace", animation: "pulse 2s ease-in-out infinite" }}>
+            <div style={{ padding:"4px 12px", background:P.amberPale, border:`1px solid ${P.amber}50`, borderRadius:20, fontSize:10, color:P.amber, fontFamily:"DM Mono, monospace", animation:"pulse 2s ease-in-out infinite" }}>
               ⚡ Breadth thrust
             </div>
           )}
           {m?.regime && (
-            <div style={{ padding: "4px 14px", background: m.regimeMeta.bg, border: `1px solid ${m.regimeMeta.color}40`, borderRadius: 20, fontSize: 10, color: m.regimeMeta.color, fontFamily: "DM Mono, monospace" }}>
+            <div style={{ padding:"4px 14px", background:m.regimeMeta.bg, border:`1px solid ${m.regimeMeta.color}40`, borderRadius:20, fontSize:10, color:m.regimeMeta.color, fontFamily:"DM Mono, monospace" }}>
               {m.regimeMeta.label}
             </div>
           )}
           {error && (
-            <div style={{ padding: "4px 12px", background: P.redPale, border: `1px solid ${P.red}30`, borderRadius: 20, fontSize: 10, color: P.red, fontFamily: "DM Mono, monospace" }}>
+            <div style={{ padding:"4px 12px", background:P.redPale, border:`1px solid ${P.red}30`, borderRadius:20, fontSize:10, color:P.red, fontFamily:"DM Mono, monospace" }}>
               {error}
             </div>
           )}
           <button onClick={fetchData} disabled={refreshing} style={{
-            background: refreshing ? P.surface2 : P.greenPale,
-            border: `1px solid ${refreshing ? P.border : P.green}60`,
-            color: refreshing ? P.textMuted : P.green,
-            padding: "5px 14px", cursor: refreshing ? "not-allowed" : "pointer",
-            fontSize: 10, fontFamily: "DM Mono, monospace", borderRadius: 20, transition: "all 0.2s",
+            background:refreshing?P.surface2:P.greenPale,
+            border:`1px solid ${refreshing?P.border:P.green}60`,
+            color:refreshing?P.textMuted:P.green,
+            padding:"5px 14px", cursor:refreshing?"not-allowed":"pointer",
+            fontSize:10, fontFamily:"DM Mono, monospace", borderRadius:20, transition:"all 0.2s",
           }}>
             {refreshing ? "Updating…" : "↻ Refresh"}
           </button>
           {lastUpdate && (
-            <div style={{ fontSize: 10, color: P.textMuted, fontFamily: "DM Mono, monospace" }}>
+            <div style={{ fontSize:10, color:P.textMuted, fontFamily:"DM Mono, monospace" }}>
               {lastUpdate.toLocaleTimeString()}
             </div>
           )}
@@ -624,7 +612,7 @@ export default function CryptoBreadthTerminal() {
 
       {/* METRIC CARDS */}
       {m && (
-        <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+        <div style={{ display:"flex", gap:8, marginBottom:14, flexWrap:"wrap" }}>
           <MetricCard label="1h Breadth"  value={m.b1  != null ? `${m.b1}%`  : "—"} pct={m.b1}/>
           <MetricCard label="24h Breadth" value={m.b24 != null ? `${m.b24}%` : "—"} pct={m.b24} sub={`VW ${m.vw24 ?? "—"}%`}/>
           <MetricCard label="7d Breadth"  value={m.b7  != null ? `${m.b7}%`  : "—"} pct={m.b7}/>
@@ -635,40 +623,34 @@ export default function CryptoBreadthTerminal() {
       )}
 
       {/* CHARTS ROW */}
-      <div style={{ display: "flex", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
+      <div style={{ display:"flex", gap:12, marginBottom:14, flexWrap:"wrap" }}>
+        <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:10, padding:"18px 18px 14px", flex:3, minWidth:280 }}>
 
-        {/* Main breadth chart */}
-        <div style={{ background: P.surface, border: `1px solid ${P.border}`, borderRadius: 10, padding: "18px 18px 14px", flex: 3, minWidth: 280 }}>
-
-          {/* Chart header with range selector */}
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10, flexWrap:"wrap", gap:8 }}>
             <div>
-              <div style={{ fontSize: 11, color: P.textSec, fontFamily: "DM Mono, monospace", letterSpacing: 1 }}>
-                1h breadth — hourly snapshots
+              <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>
+                24h Breadth — real daily history
               </div>
-              <div style={{ fontSize: 9, color: P.textMuted, fontFamily: "DM Mono, monospace", marginTop: 2 }}>
-                last 7d = real sparkline data · older = synthetic context
+              <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginTop:2 }}>
+                % of top 50 coins advancing day-over-day · bootstrapped from CoinGecko daily closes
               </div>
             </div>
-
-            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-              {/* Range buttons */}
+            <div style={{ display:"flex", gap:4, alignItems:"center", flexWrap:"wrap" }}>
               {RANGE_OPTIONS.map(opt => (
                 <button key={opt.label} onClick={() => setRange(opt.hours)} style={{
-                  background: range === opt.hours ? P.greenPale : "none",
-                  border: `1px solid ${range === opt.hours ? P.green : P.border}`,
-                  color: range === opt.hours ? P.green : P.textMuted,
-                  padding: "3px 10px", cursor: "pointer", fontSize: 10,
-                  fontFamily: "DM Mono, monospace", borderRadius: 20, transition: "all 0.15s",
+                  background:range===opt.hours?P.greenPale:"none",
+                  border:`1px solid ${range===opt.hours?P.green:P.border}`,
+                  color:range===opt.hours?P.green:P.textMuted,
+                  padding:"3px 10px", cursor:"pointer", fontSize:10,
+                  fontFamily:"DM Mono, monospace", borderRadius:20, transition:"all 0.15s",
                 }}>
                   {opt.label}
                 </button>
               ))}
-              {/* Legend */}
-              <div style={{ display: "flex", gap: 10, marginLeft: 8 }}>
-                {[["1h", P.red], ["24h", chartColor], ["7d", P.blue]].map(([lbl, col]) => (
-                  <div key={lbl} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 9, color: P.textMuted }}>
-                    <div style={{ width: 14, height: 2, background: col, borderRadius: 1 }}/>
+              <div style={{ display:"flex", gap:10, marginLeft:6 }}>
+                {[["24h",chartColor],["7d",P.blue]].map(([lbl,col]) => (
+                  <div key={lbl} style={{ display:"flex", alignItems:"center", gap:5, fontSize:9, color:P.textMuted }}>
+                    <div style={{ width:14, height:2, background:col, borderRadius:1 }}/>
                     {lbl}
                   </div>
                 ))}
@@ -676,52 +658,40 @@ export default function CryptoBreadthTerminal() {
             </div>
           </div>
 
-          {/* Zone labels */}
-          <div style={{ display: "flex", gap: 14, marginBottom: 6 }}>
-            {[["Bull >60%", P.green], ["Neutral 40–60%", P.textMuted], ["Bear <40%", P.red]].map(([lbl, col]) => (
-              <div key={lbl} style={{ fontSize: 9, color: col, fontFamily: "DM Mono, monospace" }}>— {lbl}</div>
+          <div style={{ display:"flex", gap:14, marginBottom:6 }}>
+            {[["Bull >60%",P.green],["Neutral 40–60%",P.textMuted],["Bear <40%",P.red]].map(([lbl,col]) => (
+              <div key={lbl} style={{ fontSize:9, color:col, fontFamily:"DM Mono, monospace" }}>— {lbl}</div>
             ))}
           </div>
 
           <ResponsiveContainer width="100%" height={240}>
-            <AreaChart data={visibleHistory} margin={{ top: 4, right: 4, left: -24, bottom: 0 }}>
+            <AreaChart data={visibleHistory} margin={{ top:4, right:4, left:-24, bottom:0 }}>
               <defs>
-                <linearGradient id="g1h" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor={P.red}   stopOpacity={0.15}/>
-                  <stop offset="95%" stopColor={P.red}   stopOpacity={0}/>
-                </linearGradient>
                 <linearGradient id="g24" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor={chartColor} stopOpacity={0.12}/>
+                  <stop offset="5%"  stopColor={chartColor} stopOpacity={0.22}/>
                   <stop offset="95%" stopColor={chartColor} stopOpacity={0}/>
                 </linearGradient>
                 <linearGradient id="g7" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor={P.blue}  stopOpacity={0.08}/>
-                  <stop offset="95%" stopColor={P.blue}  stopOpacity={0}/>
+                  <stop offset="5%"  stopColor={P.blue} stopOpacity={0.1}/>
+                  <stop offset="95%" stopColor={P.blue} stopOpacity={0}/>
                 </linearGradient>
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke={P.border2} vertical={false}/>
-              <XAxis
-                dataKey="dateLabel"
-                tick={{ fontSize: 8, fill: P.textMuted }}
-                tickLine={false} axisLine={false}
-                interval="preserveStartEnd"
-                minTickGap={60}
-              />
-              <YAxis domain={[0, 100]} tick={{ fontSize: 8, fill: P.textMuted }} tickLine={false} axisLine={false} tickFormatter={v => `${v}%`}/>
+              <XAxis dataKey="dateLabel" tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={50}/>
+              <YAxis domain={[0,100]} tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} tickFormatter={v=>`${v}%`}/>
               <Tooltip content={<CustomTooltip/>} labelKey="label"/>
               <ReferenceLine y={60} stroke={`${P.green}55`}     strokeDasharray="4 4"/>
               <ReferenceLine y={50} stroke={`${P.textMuted}40`} strokeDasharray="2 4"/>
               <ReferenceLine y={40} stroke={`${P.red}55`}       strokeDasharray="4 4"/>
-              <Area dataKey="b7d"  name="7d"  stroke={P.blue}      fill="url(#g7)"  strokeWidth={1}   dot={false} strokeDasharray="5 3" connectNulls/>
-              <Area dataKey="b24h" name="24h" stroke={chartColor}  fill="url(#g24)" strokeWidth={1.5} dot={false} connectNulls/>
-              <Area dataKey="b1h"  name="1h"  stroke={P.red}       fill="url(#g1h)" strokeWidth={2.5} dot={false} connectNulls/>
+              <Area dataKey="b7d"  name="7d"  stroke={P.blue}     fill="url(#g7)"  strokeWidth={1}   dot={false} strokeDasharray="5 3" connectNulls/>
+              <Area dataKey="b24h" name="24h" stroke={chartColor} fill="url(#g24)" strokeWidth={2}   dot={false} connectNulls/>
             </AreaChart>
           </ResponsiveContainer>
         </div>
 
         {/* Sector breadth */}
-        <div style={{ background: P.surface, border: `1px solid ${P.border}`, borderRadius: 10, padding: "18px", flex: 1, minWidth: 200 }}>
-          <div style={{ fontSize: 11, color: P.textSec, fontFamily: "DM Mono, monospace", letterSpacing: 1, marginBottom: 18 }}>
+        <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:10, padding:"18px", flex:1, minWidth:200 }}>
+          <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1, marginBottom:18 }}>
             Sector breadth (24h)
           </div>
           {m?.sectors.map(s => <SectorRow key={s.name} {...s}/>)}
@@ -730,27 +700,27 @@ export default function CryptoBreadthTerminal() {
 
       {/* GAINERS / LOSERS */}
       {m && (
-        <div style={{ display: "flex", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
+        <div style={{ display:"flex", gap:12, marginBottom:14, flexWrap:"wrap" }}>
           {[
-            { title: "Top gainers (24h)", list: m.gainers, col: P.green, bg: P.greenPale },
-            { title: "Top losers (24h)",  list: m.losers,  col: P.red,   bg: P.redPale   },
+            { title:"Top gainers (24h)", list:m.gainers, col:P.green, bg:P.greenPale },
+            { title:"Top losers (24h)",  list:m.losers,  col:P.red,   bg:P.redPale   },
           ].map(({ title, list, col, bg }) => (
-            <div key={title} style={{ background: P.surface, border: `1px solid ${P.border}`, borderRadius: 10, padding: "16px 18px", flex: 1, minWidth: 260 }}>
-              <div style={{ fontSize: 11, color: P.textSec, fontFamily: "DM Mono, monospace", letterSpacing: 1, marginBottom: 14 }}>{title}</div>
+            <div key={title} style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:10, padding:"16px 18px", flex:1, minWidth:260 }}>
+              <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1, marginBottom:14 }}>{title}</div>
               {list.map(c => {
                 const pct = c[PCT_KEY["24h"]];
                 return (
-                  <div key={c.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${P.border2}` }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      {c.image && <img src={c.image} alt="" style={{ width: 20, height: 20, borderRadius: "50%" }}/>}
+                  <div key={c.id} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"6px 0", borderBottom:`1px solid ${P.border2}` }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                      {c.image && <img src={c.image} alt="" style={{ width:20, height:20, borderRadius:"50%" }}/>}
                       <div>
-                        <span style={{ fontSize: 12, color: P.textPri, fontFamily: "DM Mono, monospace", fontWeight: 500 }}>{c.symbol.toUpperCase()}</span>
-                        <span style={{ fontSize: 10, color: P.textMuted, marginLeft: 6 }}>{c.name}</span>
+                        <span style={{ fontSize:12, color:P.textPri, fontFamily:"DM Mono, monospace", fontWeight:500 }}>{c.symbol.toUpperCase()}</span>
+                        <span style={{ fontSize:10, color:P.textMuted, marginLeft:6 }}>{c.name}</span>
                       </div>
                     </div>
-                    <div style={{ textAlign: "right" }}>
-                      <div style={{ fontSize: 12, color: col, background: bg, padding: "2px 8px", borderRadius: 10, fontFamily: "DM Mono, monospace" }}>{fmtPct(pct)}</div>
-                      <div style={{ fontSize: 9, color: P.textMuted, marginTop: 2 }}>{fmtPrice(c.current_price)}</div>
+                    <div style={{ textAlign:"right" }}>
+                      <div style={{ fontSize:12, color:col, background:bg, padding:"2px 8px", borderRadius:10, fontFamily:"DM Mono, monospace" }}>{fmtPct(pct)}</div>
+                      <div style={{ fontSize:9, color:P.textMuted, marginTop:2 }}>{fmtPrice(c.current_price)}</div>
                     </div>
                   </div>
                 );
@@ -761,17 +731,16 @@ export default function CryptoBreadthTerminal() {
       )}
 
       {/* COIN TABLE */}
-      <div style={{ background: P.surface, border: `1px solid ${P.border}`, borderRadius: 10, padding: "16px 18px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 8 }}>
-          <div style={{ fontSize: 11, color: P.textSec, fontFamily: "DM Mono, monospace", letterSpacing: 1 }}>All coins — top 100</div>
+      <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:10, padding:"16px 18px" }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14, flexWrap:"wrap", gap:8 }}>
+          <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>All coins — top 100</div>
           <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search…" style={{
-            background: P.surface2, border: `1px solid ${P.border}`,
-            color: P.textPri, padding: "6px 14px", fontSize: 11,
-            fontFamily: "DM Mono, monospace", borderRadius: 20, outline: "none", width: 180,
+            background:P.surface2, border:`1px solid ${P.border}`, color:P.textPri,
+            padding:"6px 14px", fontSize:11, fontFamily:"DM Mono, monospace", borderRadius:20, outline:"none", width:180,
           }}/>
         </div>
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <div style={{ overflowX:"auto" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse" }}>
             <thead>
               <tr>
                 <TH label="#"       sortK="market_cap_rank"                         align="right"/>
@@ -786,14 +755,14 @@ export default function CryptoBreadthTerminal() {
               </tr>
             </thead>
             <tbody>
-              {tableCoins.map((c, i) => <CoinRow key={c.id} c={c} rank={c.market_cap_rank} even={i % 2 !== 0}/>)}
+              {tableCoins.map((c, i) => <CoinRow key={c.id} c={c} rank={c.market_cap_rank} even={i%2!==0}/>)}
             </tbody>
           </table>
         </div>
       </div>
 
-      <div style={{ marginTop: 16, textAlign: "center", fontSize: 9, color: P.textMuted, letterSpacing: 1, fontFamily: "DM Mono, monospace" }}>
-        Data: CoinGecko free API · History stored locally in your browser · Not financial advice
+      <div style={{ marginTop:16, textAlign:"center", fontSize:9, color:P.textMuted, letterSpacing:1, fontFamily:"DM Mono, monospace" }}>
+        Data: CoinGecko free API · History stored in browser · Not financial advice
       </div>
     </div>
   );
