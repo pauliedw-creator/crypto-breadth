@@ -1,0 +1,16 @@
+{
+  "name": "Crypto Breadth Terminal",
+  "short_name": "Breadth",
+  "description": "Crypto market breadth dashboard — top 200 coins, multi-timeframe, sector breakdown",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#060910",
+  "theme_color": "#060910",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect width='192' height='192' fill='%23060910'/><text x='96' y='140' font-size='120' text-anchor='middle' fill='%2300ff88'>⬡</text></svg>",
+      "sizes": "192x192",
+      "type": "image/svg+xml"
+    }
+  ]
+}
