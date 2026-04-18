@@ -28,16 +28,37 @@ const EXCLUDE = new Set([
 ]);
 
 const SECTOR_MAP = {
+  // Layer 1s
   BTC:"L1",ETH:"L1",BNB:"L1",SOL:"L1",ADA:"L1",AVAX:"L1",DOT:"L1",
   ATOM:"L1",NEAR:"L1",ALGO:"L1",ICP:"L1",SUI:"L1",APT:"L1",TON:"L1",
   SEI:"L1",FTM:"L1",EGLD:"L1",HBAR:"L1",XLM:"L1",TRX:"L1",VET:"L1",
-  XRP:"L1",LTC:"L1",BCH:"L1",ETC:"L1",KAS:"L1",
-  MATIC:"L2",ARB:"L2",OP:"L2",IMX:"L2",STRK:"L2",ZK:"L2",
+  XRP:"L1",LTC:"L1",BCH:"L1",ETC:"L1",KAS:"L1",TIA:"L1",INJ:"L1",
+  BERA:"L1",CORE:"L1",S:"L1",SONIC:"L1",FLOW:"L1",XTZ:"L1",EOS:"L1",
+  WAVES:"L1",KAVA:"L1",MINA:"L1",CELO:"L1",ROSE:"L1",KLAY:"L1",NEO:"L1",
+  // Layer 2s
+  MATIC:"L2",ARB:"L2",OP:"L2",IMX:"L2",STRK:"L2",ZK:"L2",MNT:"L2",
+  MANTLE:"L2",METIS:"L2",BASE:"L2",BLAST:"L2",SCR:"L2",MANTA:"L2",ZRO:"L2",
+  // DeFi
   UNI:"DeFi",AAVE:"DeFi",MKR:"DeFi",CRV:"DeFi",SNX:"DeFi",COMP:"DeFi",
   LDO:"DeFi",PENDLE:"DeFi",GMX:"DeFi",DYDX:"DeFi",CAKE:"DeFi",JUP:"DeFi",
-  FET:"AI",OCEAN:"AI",RNDR:"AI",WLD:"AI",GRT:"AI",TAO:"AI",
-  DOGE:"Meme",SHIB:"Meme",PEPE:"Meme",BONK:"Meme",WIF:"Meme",
+  SUSHI:"DeFi",ENA:"DeFi",MORPHO:"DeFi",USUAL:"DeFi",RESOLV:"DeFi",
+  DRIFT:"DeFi",HYPE:"DeFi",RAY:"DeFi",EIGEN:"DeFi",ETHFI:"DeFi",
+  RUNE:"DeFi",SKY:"DeFi",ONDO:"DeFi",PYTH:"DeFi",JTO:"DeFi",OSMO:"DeFi",
+  // AI
+  FET:"AI",OCEAN:"AI",RNDR:"AI",RENDER:"AI",WLD:"AI",GRT:"AI",TAO:"AI",
+  AGIX:"AI",AKT:"AI",NMR:"AI",VIRTUAL:"AI",AIXBT:"AI",ARC:"AI",GAME:"AI",
+  GRASS:"AI",AETHIR:"AI",ATH:"AI",IO:"AI","AI16Z":"AI",SAGA:"AI",NOS:"AI",
+  // Memes
+  DOGE:"Meme",SHIB:"Meme",PEPE:"Meme",BONK:"Meme",WIF:"Meme",FLOKI:"Meme",
+  BRETT:"Meme",TURBO:"Meme",MOG:"Meme",POPCAT:"Meme",TRUMP:"Meme",
+  PNUT:"Meme",GOAT:"Meme",MEW:"Meme",NEIRO:"Meme",FARTCOIN:"Meme",
+  SPX:"Meme",MOODENG:"Meme",GIGA:"Meme",PURR:"Meme",CHILLGUY:"Meme",
+  PEOPLE:"Meme",DOGS:"Meme",MEME:"Meme",BOME:"Meme",MYRO:"Meme",
+  SLERF:"Meme",SMOG:"Meme",MAGA:"Meme",WEN:"Meme",
+  // Gaming
   AXS:"Gaming",SAND:"Gaming",MANA:"Gaming",GALA:"Gaming",RON:"Gaming",
+  BEAM:"Gaming",PIXEL:"Gaming",PRIME:"Gaming",ILV:"Gaming",YGG:"Gaming",
+  APE:"Gaming",ENJ:"Gaming",GMT:"Gaming",STEPN:"Gaming",
 };
 
 const SECTOR_META = {
@@ -135,27 +156,37 @@ const saveHistory = pts => {
 
 // ── SPARKLINE → 24h breadth (7 days hourly, real data) ────────────────
 // For each hour i, compute % of coins where price[i] > price[i-24]
-// This is the TRUE rolling 24h breadth at hourly resolution
+// Returns BOTH equal-weighted (b24h) and volume-weighted (b24h_vw)
+// Note: historical volume isn't available — we use current volume as weight,
+// which is a reasonable approximation (coin volumes are relatively stable week-over-week)
 const sparklineTo24hBreadth = (coins) => {
-  const sparklines = coins
-    .map(c => c.sparkline_in_7d?.price)
-    .filter(arr => Array.isArray(arr) && arr.length >= 25);
+  const data = coins
+    .map(c => ({ prices: c.sparkline_in_7d?.price, volume: c.total_volume || 0 }))
+    .filter(d => Array.isArray(d.prices) && d.prices.length >= 25);
 
-  if (sparklines.length < 10) return [];
+  if (data.length < 10) return [];
 
-  const len = Math.min(...sparklines.map(a => a.length));
+  const len = Math.min(...data.map(d => d.prices.length));
+  const totalVol = data.reduce((s, d) => s + d.volume, 0) || 1;
   const now = Date.now();
   const pts = [];
 
   for (let i = 24; i < len; i++) {
-    // 24h breadth: what % of coins are higher now than 24h ago
-    const adv  = sparklines.filter(arr => arr[i] > arr[i - 24]).length;
-    const b24h = Math.round(adv / sparklines.length * 100);
-    // 7d context: what % are higher than 7 days ago (only for last few points)
-    const adv7 = i >= 168 ? sparklines.filter(arr => arr[i] > arr[i - 168]).length : null;
-    const b7d  = adv7 != null ? Math.round(adv7 / sparklines.length * 100) : null;
-    const ts   = now - (len - i) * 60 * 60 * 1000;
-    pts.push({ ts, ...mkLabel(ts), b24h, b7d, seeded:false, real:true, src:"sparkline" });
+    // Equal-weighted: each coin counts once
+    const adv  = data.filter(d => d.prices[i] > d.prices[i - 24]).length;
+    const b24h = Math.round(adv / data.length * 100);
+
+    // Volume-weighted: coins count proportional to their volume
+    const advVol = data.filter(d => d.prices[i] > d.prices[i - 24])
+                       .reduce((s, d) => s + d.volume, 0);
+    const b24h_vw = Math.round(advVol / totalVol * 100);
+
+    // 7d context
+    const adv7 = i >= 168 ? data.filter(d => d.prices[i] > d.prices[i - 168]).length : null;
+    const b7d  = adv7 != null ? Math.round(adv7 / data.length * 100) : null;
+
+    const ts = now - (len - i) * 60 * 60 * 1000;
+    pts.push({ ts, ...mkLabel(ts), b24h, b24h_vw, b7d, seeded:false, real:true, src:"sparkline" });
   }
   return pts;
 };
@@ -327,8 +358,9 @@ export default function App() {
 
       // Derive real 24h breadth from sparkline prices
       const sparklinePts = sparklineTo24hBreadth(filtered);
-      const b24 = calcBreadth(filtered, "24h");
-      const b7  = calcBreadth(filtered, "7d");
+      const b24  = calcBreadth(filtered, "24h");
+      const b7   = calcBreadth(filtered, "7d");
+      const vw24 = calcVWBreadth(filtered, "24h");
 
       setHistory(prev => {
         const stored = prev.length > 0 ? prev : (loadHistory() || []);
@@ -347,7 +379,7 @@ export default function App() {
         const lastLive = [...base].reverse().find(p => p.real && p.src === "live");
         const now = Date.now();
         if (b24 != null && (!lastLive || now - lastLive.ts >= MIN_HOUR_GAP)) {
-          base = [...base, { ts:now, ...mkLabel(now), b24h:b24, b7d:b7, seeded:false, real:true, src:"live" }];
+          base = [...base, { ts:now, ...mkLabel(now), b24h:b24, b24h_vw:vw24, b7d:b7, seeded:false, real:true, src:"live" }];
         }
 
         base = base.sort((a,b) => a.ts - b.ts).slice(-MAX_POINTS);
@@ -497,8 +529,8 @@ export default function App() {
         <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:10, padding:"18px 18px 14px", flex:3, minWidth:280 }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10, flexWrap:"wrap", gap:8 }}>
             <div>
-              <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>24h Breadth — hourly</div>
-              <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginTop:2 }}>% of coins higher than 24h ago · real market data</div>
+              <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>24h Breadth — equal-weighted vs volume-weighted</div>
+              <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginTop:2 }}>Divergence between the two signals a narrow rally led by majors</div>
             </div>
             <div style={{ display:"flex", gap:4, alignItems:"center", flexWrap:"wrap" }}>
               {RANGE_OPTIONS.map(opt => (
@@ -506,10 +538,18 @@ export default function App() {
               ))}
             </div>
           </div>
-          <div style={{ display:"flex", gap:14, marginBottom:6 }}>
+          <div style={{ display:"flex", gap:14, marginBottom:6, flexWrap:"wrap" }}>
             {[["Bull >60%",P.green],["Neutral 40–60%",P.textMuted],["Bear <40%",P.red]].map(([lbl,col])=>(
               <div key={lbl} style={{ fontSize:9, color:col, fontFamily:"DM Mono, monospace" }}>— {lbl}</div>
             ))}
+            <div style={{ marginLeft:"auto", display:"flex", gap:14 }}>
+              <div style={{ fontSize:9, color:chartColor, fontFamily:"DM Mono, monospace", display:"flex", alignItems:"center", gap:4 }}>
+                <span style={{ width:14, height:2, background:chartColor, borderRadius:1 }}/> Equal-weighted
+              </div>
+              <div style={{ fontSize:9, color:P.lavender, fontFamily:"DM Mono, monospace", display:"flex", alignItems:"center", gap:4 }}>
+                <span style={{ width:14, height:2, background:P.lavender, borderRadius:1, borderTop:`1px dashed ${P.lavender}` }}/> Volume-weighted
+              </div>
+            </div>
           </div>
           <ResponsiveContainer width="100%" height={240}>
             <AreaChart data={visibleHistory} margin={{ top:4, right:4, left:-24, bottom:0 }}>
@@ -517,6 +557,10 @@ export default function App() {
                 <linearGradient id="g24" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%"  stopColor={chartColor} stopOpacity={0.22}/>
                   <stop offset="95%" stopColor={chartColor} stopOpacity={0}/>
+                </linearGradient>
+                <linearGradient id="gvw" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%"  stopColor={P.lavender} stopOpacity={0.08}/>
+                  <stop offset="95%" stopColor={P.lavender} stopOpacity={0}/>
                 </linearGradient>
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke={P.border2} vertical={false}/>
@@ -526,7 +570,8 @@ export default function App() {
               <ReferenceLine y={60} stroke={`${P.green}55`}     strokeDasharray="4 4"/>
               <ReferenceLine y={50} stroke={`${P.textMuted}40`} strokeDasharray="2 4"/>
               <ReferenceLine y={40} stroke={`${P.red}55`}       strokeDasharray="4 4"/>
-              <Area dataKey="b24h" name="24h breadth" stroke={chartColor} fill="url(#g24)" strokeWidth={2} dot={false} connectNulls/>
+              <Area dataKey="b24h_vw" name="24h VW" stroke={P.lavender} fill="url(#gvw)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} connectNulls/>
+              <Area dataKey="b24h"    name="24h EW" stroke={chartColor} fill="url(#g24)" strokeWidth={2}   dot={false} connectNulls/>
             </AreaChart>
           </ResponsiveContainer>
 
