@@ -15,7 +15,7 @@ const P = {
   lavender:"#8b7fba", teal:"#4a9e9e",
 };
 
-const STORAGE_KEY  = "cbt_bybit_v1";
+const STORAGE_KEY  = "cbt_bybit_v2";
 const MIN_HOUR_GAP = 15 * 60 * 1000;
 const MAX_POINTS   = 3000;
 
@@ -81,13 +81,6 @@ const RANGE_OPTIONS = [
   {label:"All", hours:10000},
 ];
 
-const METRIC_OPTIONS = [
-  { key:"mom24",      label:"Momentum 24h",     desc:"% higher than 24h ago" },
-  { key:"aboveSMA24", label:"Above 24h SMA",    desc:"Trend participation" },
-  { key:"aboveSMA7d", label:"Above 7d SMA",     desc:"Slower trend" },
-  { key:"session",    label:"Session (UTC)",    desc:"% higher than 00:00 UTC open" },
-];
-
 const BYBIT_BASE = "https://api.bybit.com";
 
 // ── helpers ──────────────────────────────────
@@ -96,14 +89,6 @@ const calcBreadth = (coins, tf) => {
   const v = coins.filter(c => c[k] != null);
   if (!v.length) return null;
   return Math.round(v.filter(c => c[k] > 0).length / v.length * 100);
-};
-const calcVWBreadth = (coins, tf) => {
-  const k = PCT_KEY[tf];
-  const v = coins.filter(c => c[k] != null && c.total_volume > 0);
-  if (!v.length) return null;
-  const tot = v.reduce((s,c) => s + c.total_volume, 0);
-  const adv = v.filter(c => c[k] > 0).reduce((s,c) => s + c.total_volume, 0);
-  return Math.round(adv / tot * 100);
 };
 const getRegime = (b24, b7) => {
   if (b24 == null) return null;
@@ -136,16 +121,6 @@ const mkLabel = ts => {
     label:     d.toLocaleDateString([],{month:"short",day:"numeric"}) + " " + d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),
     dateLabel: d.toLocaleDateString([],{month:"short",day:"numeric"}),
   };
-};
-const makeSMA = (arr, period) => {
-  const sma = new Array(arr.length).fill(null);
-  let sum = 0;
-  for (let i = 0; i < arr.length; i++) {
-    sum += arr[i];
-    if (i >= period) sum -= arr[i - period];
-    if (i >= period - 1) sma[i] = sum / period;
-  }
-  return sma;
 };
 
 const loadHistory = () => {
@@ -228,7 +203,8 @@ const fetchAllBybitHistory = async (coins, onProgress) => {
   return priceData;
 };
 
-// ── Compute all 4 breadth metrics from Bybit klines ───────────────────
+// ── Compute momentum breadth at 1h, 24h, 7d, 30d windows ─────────────
+// mom_N at time t = % of coins where price[t] > price[t-N hours]
 const computeBreadthFromBybit = (priceData) => {
   const coinIds = Object.keys(priceData);
   if (coinIds.length < 10) return [];
@@ -246,57 +222,41 @@ const computeBreadthFromBybit = (priceData) => {
     priceIndex[id] = idx;
   }
 
-  // Precompute running SMAs
-  const smas24 = {}, smas7d = {};
-  for (const id of coinIds) {
-    const closes = priceData[id].prices.map(p => p.close);
-    smas24[id] = makeSMA(closes, 24);
-    smas7d[id] = makeSMA(closes, 168);
-  }
-
   const pts = [];
   for (let ri = 24; ri < refTimestamps.length; ri++) {
     const ts = refTimestamps[ri];
-    const d  = new Date(ts);
-    const midnightTs = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0);
-
-    let count = 0, countVol = 0;
-    let advSMA = 0, advSMAvol = 0;
-    let advMom = 0, advMomVol = 0;
-    let advSess = 0, advSessVol = 0;
-    let advSMA7 = 0, advSMA7Vol = 0, count7 = 0, count7Vol = 0;
+    let count = 0;
+    let adv1  = 0, c1  = 0;
+    let adv24 = 0, c24 = 0;
+    let adv7d = 0, c7d = 0;
+    let adv30 = 0, c30 = 0;
 
     for (const id of coinIds) {
       const idx = priceIndex[id].get(ts);
-      if (idx === undefined || idx < 24) continue;
-
-      const vol = priceData[id].volume;
-      const price = priceData[id].prices[idx].close;
-
+      if (idx === undefined) continue;
+      const prices = priceData[id].prices;
+      const price  = prices[idx].close;
       count++;
-      countVol += vol;
 
-      // Above 24h SMA
-      const sma24 = smas24[id][idx - 1];
-      if (sma24 != null && price > sma24) { advSMA++; advSMAvol += vol; }
-
-      // Momentum 24h
-      const p24 = priceData[id].prices[idx - 24]?.close;
-      if (p24 != null && price > p24) { advMom++; advMomVol += vol; }
-
-      // Session (vs 00:00 UTC of same day)
-      const midIdx = priceIndex[id].get(midnightTs);
-      if (midIdx !== undefined && midIdx < idx) {
-        const openPrice = priceData[id].prices[midIdx].close;
-        if (price > openPrice) { advSess++; advSessVol += vol; }
+      // 1h
+      if (idx >= 1) {
+        c1++;
+        if (price > prices[idx - 1].close) adv1++;
       }
-
-      // Above 7d SMA
-      const sma7 = smas7d[id][idx - 1];
-      if (sma7 != null) {
-        count7++;
-        count7Vol += vol;
-        if (price > sma7) { advSMA7++; advSMA7Vol += vol; }
+      // 24h
+      if (idx >= 24) {
+        c24++;
+        if (price > prices[idx - 24].close) adv24++;
+      }
+      // 7d
+      if (idx >= 168) {
+        c7d++;
+        if (price > prices[idx - 168].close) adv7d++;
+      }
+      // 30d (approximate — we have max ~41 days)
+      if (idx >= 720) {
+        c30++;
+        if (price > prices[idx - 720].close) adv30++;
       }
     }
 
@@ -304,17 +264,10 @@ const computeBreadthFromBybit = (priceData) => {
 
     pts.push({
       ts, ...mkLabel(ts),
-      aboveSMA24:    Math.round(advSMA  / count * 100),
-      aboveSMA24_vw: countVol > 0 ? Math.round(advSMAvol / countVol * 100) : null,
-      mom24:         Math.round(advMom  / count * 100),
-      mom24_vw:      countVol > 0 ? Math.round(advMomVol / countVol * 100) : null,
-      session:       Math.round(advSess / count * 100),
-      session_vw:    countVol > 0 ? Math.round(advSessVol / countVol * 100) : null,
-      aboveSMA7d:    count7 > 0 ? Math.round(advSMA7 / count7 * 100) : null,
-      aboveSMA7d_vw: count7Vol > 0 ? Math.round(advSMA7Vol / count7Vol * 100) : null,
-      b24h:          Math.round(advSMA / count * 100),
-      b24h_vw:       countVol > 0 ? Math.round(advSMAvol / countVol * 100) : null,
-      b7d:           null,
+      mom1h:  c1  > 0 ? Math.round(adv1  / c1  * 100) : null,
+      mom24:  c24 > 0 ? Math.round(adv24 / c24 * 100) : null,
+      mom7d:  c7d > 0 ? Math.round(adv7d / c7d * 100) : null,
+      mom30d: c30 > 0 ? Math.round(adv30 / c30 * 100) : null,
       seeded: false, real: true, src: "bybit",
     });
   }
@@ -401,7 +354,6 @@ export default function App() {
   const [sortKey, setSortKey]       = useState("market_cap");
   const [sortDir, setSortDir]       = useState("desc");
   const [range, setRange]           = useState(336); // default 14d
-  const [metric, setMetric]         = useState("mom24"); // default to momentum 24h
   const bootRan = useRef(false);
 
   useEffect(() => {
@@ -503,23 +455,21 @@ export default function App() {
   const visibleHistory = useMemo(() => {
     if (!history.length) return [];
     const cutoff = Date.now() - range * 60 * 60 * 1000;
-    const pts = history.filter(p => p.ts >= cutoff && p[metric] != null);
+    const pts = history.filter(p => p.ts >= cutoff && p.mom24 != null);
     const maxPts = range <= 168 ? pts.length : 500;
     if (pts.length <= maxPts) return pts;
     const step = Math.ceil(pts.length / maxPts);
     return pts.filter((_, i) => i % step === 0 || i === pts.length - 1);
-  }, [history, range, metric]);
+  }, [history, range]);
 
   const m = useMemo(() => {
     if (!coins.length) return null;
-    // Use latest Bybit-computed point if available, fallback to CoinGecko API
+    // All timeframes use the same methodology: Bybit momentum breadth
     const latest = history.length > 0 ? history[history.length - 1] : null;
-    const b1  = calcBreadth(coins, "1h");
-    const b24 = latest?.[metric] ?? calcBreadth(coins, "24h");
-    const vw24 = latest?.[`${metric}_vw`] ?? calcVWBreadth(coins, "24h");
-    const b24Momentum = calcBreadth(coins, "24h");
-    const b7  = calcBreadth(coins, "7d");
-    const b30 = calcBreadth(coins, "30d");
+    const b1  = latest?.mom1h  ?? calcBreadth(coins, "1h");
+    const b24 = latest?.mom24  ?? calcBreadth(coins, "24h");
+    const b7  = latest?.mom7d  ?? calcBreadth(coins, "7d");
+    const b30 = latest?.mom30d ?? calcBreadth(coins, "30d");
     const r   = getRegime(b24, b7);
     const k24 = PCT_KEY["24h"];
     const adv = coins.filter(c => (c[k24] ?? c.price_change_percentage_24h ?? 0) > 0).length;
@@ -533,8 +483,8 @@ export default function App() {
     });
     const sectors = Object.entries(secMap).map(([name,d])=>({name,pct:Math.round(d.adv/d.total*100),adv:d.adv,total:d.total})).sort((a,b)=>b.total-a.total);
     const sorted = [...coins].filter(c=>c[k24]!=null).sort((a,b)=>b[k24]-a[k24]);
-    return { b1, b24, b7, b30, vw24, b24Momentum, regime:r, regimeMeta:r?REGIME_META[r]:REGIME_META.NEUTRAL, adv, dec, sectors, gainers:sorted.slice(0,8), losers:sorted.slice(-8).reverse() };
-  }, [coins, history, metric]);
+    return { b1, b24, b7, b30, regime:r, regimeMeta:r?REGIME_META[r]:REGIME_META.NEUTRAL, adv, dec, sectors, gainers:sorted.slice(0,8), losers:sorted.slice(-8).reverse() };
+  }, [coins, history]);
 
   const tableCoins = useMemo(() => {
     let r=[...coins];
@@ -603,12 +553,12 @@ export default function App() {
       {/* METRIC CARDS */}
       {m && (
         <div style={{ display:"flex", gap:8, marginBottom:14, flexWrap:"wrap" }}>
-          <MetricCard label="1h Breadth"    value={m.b1  != null?`${m.b1}%`:"—"}  pct={m.b1}/>
-          <MetricCard label={METRIC_OPTIONS.find(o=>o.key===metric)?.label || "24h Breadth"} value={m.b24 != null?`${m.b24}%`:"—"} pct={m.b24} sub={`VW ${m.vw24??"—"}% · Mom ${m.b24Momentum??"—"}%`}/>
-          <MetricCard label="7d Breadth"    value={m.b7  != null?`${m.b7}%`:"—"}  pct={m.b7}/>
-          <MetricCard label="30d Breadth"   value={m.b30 != null?`${m.b30}%`:"—"} pct={m.b30}/>
-          <MetricCard label="Advancing"     value={m.adv} pct={70} sub={`of ${m.adv+m.dec}`}/>
-          <MetricCard label="Declining"     value={m.dec} pct={30}/>
+          <MetricCard label="1h Breadth"  value={m.b1  != null?`${m.b1}%`:"—"}  pct={m.b1}/>
+          <MetricCard label="24h Breadth" value={m.b24 != null?`${m.b24}%`:"—"} pct={m.b24}/>
+          <MetricCard label="7d Breadth"  value={m.b7  != null?`${m.b7}%`:"—"}  pct={m.b7}/>
+          <MetricCard label="30d Breadth" value={m.b30 != null?`${m.b30}%`:"—"} pct={m.b30}/>
+          <MetricCard label="Advancing"   value={m.adv} pct={70} sub={`of ${m.adv+m.dec}`}/>
+          <MetricCard label="Declining"   value={m.dec} pct={30}/>
         </div>
       )}
 
@@ -618,10 +568,10 @@ export default function App() {
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10, flexWrap:"wrap", gap:8 }}>
             <div>
               <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>
-                Breadth — {METRIC_OPTIONS.find(o => o.key === metric)?.label}
+                24h Breadth
               </div>
               <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginTop:2 }}>
-                {METRIC_OPTIONS.find(o => o.key === metric)?.desc} · {Object.keys(history.length > 0 ? {x:1}:{}).length ? "real" : "real"} Bybit spot closes
+                % of coins higher than 24h ago · real hourly closes from Bybit spot
               </div>
             </div>
             <div style={{ display:"flex", gap:4, alignItems:"center", flexWrap:"wrap" }}>
@@ -631,31 +581,10 @@ export default function App() {
             </div>
           </div>
 
-          {/* Metric selector */}
-          <div style={{ display:"flex", gap:4, marginBottom:10, flexWrap:"wrap" }}>
-            {METRIC_OPTIONS.map(opt => (
-              <button key={opt.key} onClick={()=>setMetric(opt.key)} style={{
-                background:metric===opt.key?P.lavender+"20":"none",
-                border:`1px solid ${metric===opt.key?P.lavender:P.border}`,
-                color:metric===opt.key?P.lavender:P.textMuted,
-                padding:"4px 10px", cursor:"pointer", fontSize:10,
-                fontFamily:"DM Mono, monospace", borderRadius:4, transition:"all 0.15s",
-              }}>{opt.label}</button>
-            ))}
-          </div>
-
           <div style={{ display:"flex", gap:14, marginBottom:6, flexWrap:"wrap" }}>
             {[["Bull >60%",P.green],["Neutral 40–60%",P.textMuted],["Bear <40%",P.red]].map(([lbl,col])=>(
               <div key={lbl} style={{ fontSize:9, color:col, fontFamily:"DM Mono, monospace" }}>— {lbl}</div>
             ))}
-            <div style={{ marginLeft:"auto", display:"flex", gap:14 }}>
-              <div style={{ fontSize:9, color:chartColor, fontFamily:"DM Mono, monospace", display:"flex", alignItems:"center", gap:4 }}>
-                <span style={{ width:14, height:2, background:chartColor, borderRadius:1 }}/> Equal-weighted
-              </div>
-              <div style={{ fontSize:9, color:P.lavender, fontFamily:"DM Mono, monospace", display:"flex", alignItems:"center", gap:4 }}>
-                <span style={{ width:14, height:2, background:P.lavender, borderRadius:1 }}/> Volume-weighted
-              </div>
-            </div>
           </div>
 
           <ResponsiveContainer width="100%" height={260}>
@@ -665,10 +594,6 @@ export default function App() {
                   <stop offset="5%"  stopColor={chartColor} stopOpacity={0.22}/>
                   <stop offset="95%" stopColor={chartColor} stopOpacity={0}/>
                 </linearGradient>
-                <linearGradient id="gvw" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor={P.lavender} stopOpacity={0.08}/>
-                  <stop offset="95%" stopColor={P.lavender} stopOpacity={0}/>
-                </linearGradient>
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke={P.border2} vertical={false}/>
               <XAxis dataKey="dateLabel" tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={50}/>
@@ -677,8 +602,7 @@ export default function App() {
               <ReferenceLine y={60} stroke={`${P.green}55`}     strokeDasharray="4 4"/>
               <ReferenceLine y={50} stroke={`${P.textMuted}40`} strokeDasharray="2 4"/>
               <ReferenceLine y={40} stroke={`${P.red}55`}       strokeDasharray="4 4"/>
-              <Area dataKey={`${metric}_vw`} name="Volume-weighted" stroke={P.lavender} fill="url(#gvw)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} connectNulls/>
-              <Area dataKey={metric}          name="Equal-weighted"  stroke={chartColor} fill="url(#g24)" strokeWidth={2}   dot={false} connectNulls/>
+              <Area dataKey="mom24" name="24h Breadth" stroke={chartColor} fill="url(#g24)" strokeWidth={2} dot={false} connectNulls/>
             </AreaChart>
           </ResponsiveContainer>
 
