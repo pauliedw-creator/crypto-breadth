@@ -15,9 +15,9 @@ const P = {
   lavender:"#8b7fba", teal:"#4a9e9e",
 };
 
-const STORAGE_KEY  = "cbt_v11";
-const MIN_HOUR_GAP = 15 * 60 * 1000;  // 15 min — captures intraday oscillation
-const MAX_POINTS   = 8640;             // 90 days × 96 points/day (at 15 min intervals)
+const STORAGE_KEY  = "cbt_bybit_v1";
+const MIN_HOUR_GAP = 15 * 60 * 1000;
+const MAX_POINTS   = 3000;
 
 const EXCLUDE = new Set([
   "USDT","USDC","BUSD","DAI","TUSD","USDP","GUSD","FRAX","LUSD","SUSD",
@@ -28,37 +28,29 @@ const EXCLUDE = new Set([
 ]);
 
 const SECTOR_MAP = {
-  // Layer 1s
   BTC:"L1",ETH:"L1",BNB:"L1",SOL:"L1",ADA:"L1",AVAX:"L1",DOT:"L1",
   ATOM:"L1",NEAR:"L1",ALGO:"L1",ICP:"L1",SUI:"L1",APT:"L1",TON:"L1",
   SEI:"L1",FTM:"L1",EGLD:"L1",HBAR:"L1",XLM:"L1",TRX:"L1",VET:"L1",
   XRP:"L1",LTC:"L1",BCH:"L1",ETC:"L1",KAS:"L1",TIA:"L1",INJ:"L1",
   BERA:"L1",CORE:"L1",S:"L1",SONIC:"L1",FLOW:"L1",XTZ:"L1",EOS:"L1",
-  WAVES:"L1",KAVA:"L1",MINA:"L1",CELO:"L1",ROSE:"L1",KLAY:"L1",NEO:"L1",
-  // Layer 2s
   MATIC:"L2",ARB:"L2",OP:"L2",IMX:"L2",STRK:"L2",ZK:"L2",MNT:"L2",
   MANTLE:"L2",METIS:"L2",BASE:"L2",BLAST:"L2",SCR:"L2",MANTA:"L2",ZRO:"L2",
-  // DeFi
   UNI:"DeFi",AAVE:"DeFi",MKR:"DeFi",CRV:"DeFi",SNX:"DeFi",COMP:"DeFi",
   LDO:"DeFi",PENDLE:"DeFi",GMX:"DeFi",DYDX:"DeFi",CAKE:"DeFi",JUP:"DeFi",
   SUSHI:"DeFi",ENA:"DeFi",MORPHO:"DeFi",USUAL:"DeFi",RESOLV:"DeFi",
   DRIFT:"DeFi",HYPE:"DeFi",RAY:"DeFi",EIGEN:"DeFi",ETHFI:"DeFi",
   RUNE:"DeFi",SKY:"DeFi",ONDO:"DeFi",PYTH:"DeFi",JTO:"DeFi",OSMO:"DeFi",
-  // AI
   FET:"AI",OCEAN:"AI",RNDR:"AI",RENDER:"AI",WLD:"AI",GRT:"AI",TAO:"AI",
   AGIX:"AI",AKT:"AI",NMR:"AI",VIRTUAL:"AI",AIXBT:"AI",ARC:"AI",GAME:"AI",
-  GRASS:"AI",AETHIR:"AI",ATH:"AI",IO:"AI","AI16Z":"AI",SAGA:"AI",NOS:"AI",
-  // Memes
+  GRASS:"AI",AETHIR:"AI",ATH:"AI",IO:"AI","AI16Z":"AI",SAGA:"AI",
   DOGE:"Meme",SHIB:"Meme",PEPE:"Meme",BONK:"Meme",WIF:"Meme",FLOKI:"Meme",
   BRETT:"Meme",TURBO:"Meme",MOG:"Meme",POPCAT:"Meme",TRUMP:"Meme",
   PNUT:"Meme",GOAT:"Meme",MEW:"Meme",NEIRO:"Meme",FARTCOIN:"Meme",
   SPX:"Meme",MOODENG:"Meme",GIGA:"Meme",PURR:"Meme",CHILLGUY:"Meme",
   PEOPLE:"Meme",DOGS:"Meme",MEME:"Meme",BOME:"Meme",MYRO:"Meme",
-  SLERF:"Meme",SMOG:"Meme",MAGA:"Meme",WEN:"Meme",
-  // Gaming
   AXS:"Gaming",SAND:"Gaming",MANA:"Gaming",GALA:"Gaming",RON:"Gaming",
   BEAM:"Gaming",PIXEL:"Gaming",PRIME:"Gaming",ILV:"Gaming",YGG:"Gaming",
-  APE:"Gaming",ENJ:"Gaming",GMT:"Gaming",STEPN:"Gaming",
+  APE:"Gaming",ENJ:"Gaming",GMT:"Gaming",
 };
 
 const SECTOR_META = {
@@ -84,24 +76,19 @@ const PCT_KEY = {
 
 const RANGE_OPTIONS = [
   {label:"7d",  hours:168},
+  {label:"14d", hours:336},
   {label:"30d", hours:720},
-  {label:"90d", hours:2160},
+  {label:"All", hours:10000},
 ];
 
 const METRIC_OPTIONS = [
+  { key:"mom24",      label:"Momentum 24h",     desc:"% higher than 24h ago" },
   { key:"aboveSMA24", label:"Above 24h SMA",    desc:"Trend participation" },
   { key:"aboveSMA7d", label:"Above 7d SMA",     desc:"Slower trend" },
-  { key:"mom24",      label:"Momentum 24h",     desc:"Price vs 24h ago" },
-  { key:"session",    label:"Session (UTC)",    desc:"Price vs 00:00 UTC open" },
+  { key:"session",    label:"Session (UTC)",    desc:"% higher than 00:00 UTC open" },
 ];
 
-// Coins to bootstrap — small reliable set to minimise API calls
-const BOOT_IDS = [
-  "bitcoin","ethereum","binancecoin","solana","ripple",
-  "cardano","avalanche-2","polkadot","chainlink","litecoin",
-  "dogecoin","shiba-inu","uniswap","aave","near",
-  "cosmos","algorand","stellar","tron","vechain",
-];
+const BYBIT_BASE = "https://api.bybit.com";
 
 // ── helpers ──────────────────────────────────
 const calcBreadth = (coins, tf) => {
@@ -150,8 +137,17 @@ const mkLabel = ts => {
     dateLabel: d.toLocaleDateString([],{month:"short",day:"numeric"}),
   };
 };
+const makeSMA = (arr, period) => {
+  const sma = new Array(arr.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < arr.length; i++) {
+    sum += arr[i];
+    if (i >= period) sum -= arr[i - period];
+    if (i >= period - 1) sma[i] = sum / period;
+  }
+  return sma;
+};
 
-// ── storage ───────────────────────────────────
 const loadHistory = () => {
   try { const r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : null; }
   catch { return null; }
@@ -161,178 +157,169 @@ const saveHistory = pts => {
   catch {}
 };
 
-// ── SPARKLINE → all breadth metrics (7 days hourly, real data) ─────────
-// Computes four breadth variants at every hour so users can toggle:
-//   - aboveSMA24: % above 24h SMA (trend)
-//   - mom24:      % up vs 24h ago (momentum)
-//   - session:    % up vs most recent 00:00 UTC open (intraday)
-//   - aboveSMA7d: % above 7-day SMA (slower trend)
-const SMA_PERIOD = 24;
-const SMA_7D     = 168;
-
-const computeAllBreadth = (coins) => {
-  const data = coins
-    .map(c => ({ prices: c.sparkline_in_7d?.price, volume: c.total_volume || 0 }))
-    .filter(d => Array.isArray(d.prices) && d.prices.length >= SMA_PERIOD + 1);
-
-  if (data.length < 10) return [];
-
-  const len = Math.min(...data.map(d => d.prices.length));
-  const totalVol = data.reduce((s, d) => s + d.volume, 0) || 1;
-  const now = Date.now();
-
-  // Pre-compute running 24h SMAs for each coin
-  const smas24 = data.map(d => {
-    const arr = d.prices;
-    const sma = new Array(arr.length).fill(null);
-    let sum = 0;
-    for (let i = 0; i < arr.length; i++) {
-      sum += arr[i];
-      if (i >= SMA_PERIOD) sum -= arr[i - SMA_PERIOD];
-      if (i >= SMA_PERIOD - 1) sma[i] = sum / SMA_PERIOD;
+// ── BYBIT: fetch real exchange candles ────────────────────────────────
+const fetchBybitSymbols = async () => {
+  try {
+    const res = await fetch(`${BYBIT_BASE}/v5/market/instruments-info?category=spot&limit=1000`);
+    if (!res.ok) throw new Error("instruments-info failed");
+    const data = await res.json();
+    if (data.retCode !== 0) throw new Error(data.retMsg || "Bybit error");
+    const valid = new Set();
+    for (const inst of data.result.list) {
+      if (inst.quoteCoin === "USDT" && inst.status === "Trading") valid.add(inst.baseCoin);
     }
-    return sma;
-  });
+    return valid;
+  } catch (e) {
+    console.error("[Bybit] symbols fetch failed:", e);
+    return null;
+  }
+};
 
-  // Pre-compute running 7d SMAs
-  const smas7d = data.map(d => {
-    const arr = d.prices;
-    const sma = new Array(arr.length).fill(null);
-    let sum = 0;
-    for (let i = 0; i < arr.length; i++) {
-      sum += arr[i];
-      if (i >= SMA_7D) sum -= arr[i - SMA_7D];
-      if (i >= SMA_7D - 1) sma[i] = sum / SMA_7D;
-    }
-    return sma;
-  });
+const fetchBybitKlines = async (symbol) => {
+  try {
+    const res = await fetch(
+      `${BYBIT_BASE}/v5/market/kline?category=spot&symbol=${symbol}USDT&interval=60&limit=1000`
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.retCode !== 0 || !Array.isArray(data.result?.list)) return null;
+    // Bybit returns newest→oldest, reverse to oldest→newest
+    // Format: [startMs, open, high, low, close, volume, turnover]
+    return data.result.list.slice().reverse().map(k => ({
+      ts:    parseInt(k[0], 10),
+      close: parseFloat(k[4]),
+    })).filter(p => !isNaN(p.close) && p.close > 0);
+  } catch {
+    return null;
+  }
+};
+
+const fetchAllBybitHistory = async (coins, onProgress) => {
+  const validSymbols = await fetchBybitSymbols();
+  if (!validSymbols) throw new Error("Bybit instruments-info unreachable");
+
+  const eligible = coins.filter(c => validSymbols.has(c.symbol.toUpperCase()));
+  console.log(`[Bybit] ${eligible.length}/${coins.length} coins eligible for klines`);
+
+  const priceData = {};
+  let done = 0;
+  const CONCURRENCY = 12;
+
+  for (let i = 0; i < eligible.length; i += CONCURRENCY) {
+    const batch = eligible.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(
+      batch.map(coin => fetchBybitKlines(coin.symbol.toUpperCase()))
+    );
+    batch.forEach((coin, idx) => {
+      if (results[idx] && results[idx].length >= 30) {
+        priceData[coin.id] = {
+          prices: results[idx],
+          volume: coin.total_volume || 0,
+          symbol: coin.symbol.toUpperCase(),
+        };
+      }
+    });
+    done += batch.length;
+    onProgress(Math.round(done / eligible.length * 100));
+    await sleep(100);
+  }
+
+  console.log(`[Bybit] Got kline data for ${Object.keys(priceData).length} coins`);
+  return priceData;
+};
+
+// ── Compute all 4 breadth metrics from Bybit klines ───────────────────
+const computeBreadthFromBybit = (priceData) => {
+  const coinIds = Object.keys(priceData);
+  if (coinIds.length < 10) return [];
+
+  // Use the coin with most data as the time reference
+  const refId = coinIds.reduce((a, b) =>
+    priceData[a].prices.length >= priceData[b].prices.length ? a : b);
+  const refTimestamps = priceData[refId].prices.map(p => p.ts);
+
+  // Build O(1) timestamp→index lookup per coin
+  const priceIndex = {};
+  for (const id of coinIds) {
+    const idx = new Map();
+    priceData[id].prices.forEach((p, i) => idx.set(p.ts, i));
+    priceIndex[id] = idx;
+  }
+
+  // Precompute running SMAs
+  const smas24 = {}, smas7d = {};
+  for (const id of coinIds) {
+    const closes = priceData[id].prices.map(p => p.close);
+    smas24[id] = makeSMA(closes, 24);
+    smas7d[id] = makeSMA(closes, 168);
+  }
 
   const pts = [];
-  for (let i = SMA_PERIOD; i < len; i++) {
-    const ts = now - (len - i) * 60 * 60 * 1000;
-    const utcDate = new Date(ts);
-    // Find the index in sparkline corresponding to most recent 00:00 UTC
-    const midnightTs = Date.UTC(utcDate.getUTCFullYear(), utcDate.getUTCMonth(), utcDate.getUTCDate(), 0, 0, 0);
-    const hoursSinceMidnight = Math.floor((ts - midnightTs) / (60 * 60 * 1000));
-    const sessionIdx = i - hoursSinceMidnight;
+  for (let ri = 24; ri < refTimestamps.length; ri++) {
+    const ts = refTimestamps[ri];
+    const d  = new Date(ts);
+    const midnightTs = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0);
 
+    let count = 0, countVol = 0;
     let advSMA = 0, advSMAvol = 0;
     let advMom = 0, advMomVol = 0;
-    let advSess = 0, advSessVol = 0, sessCount = 0, sessVolTotal = 0;
-    let advSMA7 = 0, advSMA7Vol = 0, sma7Count = 0, sma7VolTotal = 0;
+    let advSess = 0, advSessVol = 0;
+    let advSMA7 = 0, advSMA7Vol = 0, count7 = 0, count7Vol = 0;
 
-    for (let j = 0; j < data.length; j++) {
-      const d = data[j];
-      const vol = d.volume;
-      const price = d.prices[i];
+    for (const id of coinIds) {
+      const idx = priceIndex[id].get(ts);
+      if (idx === undefined || idx < 24) continue;
+
+      const vol = priceData[id].volume;
+      const price = priceData[id].prices[idx].close;
+
+      count++;
+      countVol += vol;
 
       // Above 24h SMA
-      const sma24 = smas24[j][i - 1];
+      const sma24 = smas24[id][idx - 1];
       if (sma24 != null && price > sma24) { advSMA++; advSMAvol += vol; }
 
       // Momentum 24h
-      if (d.prices[i - 24] != null && price > d.prices[i - 24]) { advMom++; advMomVol += vol; }
+      const p24 = priceData[id].prices[idx - 24]?.close;
+      if (p24 != null && price > p24) { advMom++; advMomVol += vol; }
 
-      // Session (vs daily open at 00:00 UTC)
-      if (sessionIdx >= 0 && sessionIdx < i) {
-        const openPrice = d.prices[sessionIdx];
-        if (openPrice != null) {
-          sessCount++;
-          sessVolTotal += vol;
-          if (price > openPrice) { advSess++; advSessVol += vol; }
-        }
+      // Session (vs 00:00 UTC of same day)
+      const midIdx = priceIndex[id].get(midnightTs);
+      if (midIdx !== undefined && midIdx < idx) {
+        const openPrice = priceData[id].prices[midIdx].close;
+        if (price > openPrice) { advSess++; advSessVol += vol; }
       }
 
-      // Above 7d SMA (only available once we have 168+ hours)
-      const sma7 = smas7d[j][i - 1];
+      // Above 7d SMA
+      const sma7 = smas7d[id][idx - 1];
       if (sma7 != null) {
-        sma7Count++;
-        sma7VolTotal += vol;
+        count7++;
+        count7Vol += vol;
         if (price > sma7) { advSMA7++; advSMA7Vol += vol; }
       }
     }
 
+    if (count < 10) continue;
+
     pts.push({
       ts, ...mkLabel(ts),
-      aboveSMA24:    Math.round(advSMA / data.length * 100),
-      aboveSMA24_vw: Math.round(advSMAvol / totalVol * 100),
-      mom24:         Math.round(advMom / data.length * 100),
-      mom24_vw:      Math.round(advMomVol / totalVol * 100),
-      session:       sessCount > 5 ? Math.round(advSess / sessCount * 100) : null,
-      session_vw:    sessVolTotal > 0 ? Math.round(advSessVol / sessVolTotal * 100) : null,
-      aboveSMA7d:    sma7Count > 5 ? Math.round(advSMA7 / sma7Count * 100) : null,
-      aboveSMA7d_vw: sma7VolTotal > 0 ? Math.round(advSMA7Vol / sma7VolTotal * 100) : null,
-      // Keep b24h/b24h_vw as aliases for backwards compat (defaults to aboveSMA24)
-      b24h:          Math.round(advSMA / data.length * 100),
-      b24h_vw:       Math.round(advSMAvol / totalVol * 100),
+      aboveSMA24:    Math.round(advSMA  / count * 100),
+      aboveSMA24_vw: countVol > 0 ? Math.round(advSMAvol / countVol * 100) : null,
+      mom24:         Math.round(advMom  / count * 100),
+      mom24_vw:      countVol > 0 ? Math.round(advMomVol / countVol * 100) : null,
+      session:       Math.round(advSess / count * 100),
+      session_vw:    countVol > 0 ? Math.round(advSessVol / countVol * 100) : null,
+      aboveSMA7d:    count7 > 0 ? Math.round(advSMA7 / count7 * 100) : null,
+      aboveSMA7d_vw: count7Vol > 0 ? Math.round(advSMA7Vol / count7Vol * 100) : null,
+      b24h:          Math.round(advSMA / count * 100),
+      b24h_vw:       countVol > 0 ? Math.round(advSMAvol / countVol * 100) : null,
       b7d:           null,
-      seeded: false, real: true, src: "sparkline",
+      seeded: false, real: true, src: "bybit",
     });
   }
+
   return pts;
-};
-
-// Current snapshot of all metrics from latest sparkline point
-const currentAllBreadth = (coins) => {
-  const pts = computeAllBreadth(coins);
-  return pts.length > 0 ? pts[pts.length - 1] : null;
-};
-
-// ── BOOTSTRAP: fetch daily closes, compute daily 24h breadth ──────────
-const fetchBootstrap = async (onProgress) => {
-  const series = {};
-  let done = 0;
-
-  for (const id of BOOT_IDS) {
-    try {
-      const res = await fetch(
-        `https://api.coingecko.com/api/v3/coins/${id}/market_chart?vs_currency=usd&days=90&interval=daily`
-      );
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.prices?.length > 10) series[id] = data.prices;
-      }
-    } catch {}
-    done++;
-    onProgress(Math.round(done / BOOT_IDS.length * 100));
-    await sleep(2500);
-  }
-
-  const allSeries = Object.values(series);
-  console.log(`[Bootstrap] Got price history for ${allSeries.length}/${BOOT_IDS.length} coins`);
-  if (allSeries.length < 3) return []; // need at least 3 coins
-
-  // Use bitcoin as time reference (most reliable)
-  const ref = series["bitcoin"] || allSeries[0];
-  const pts = [];
-
-  for (let i = 1; i < ref.length; i++) {
-    const ts     = ref[i][0];
-    const prevTs = ref[i - 1][0];
-    let adv = 0, total = 0;
-
-    for (const s of allSeries) {
-      // Find price closest to ts and prevTs within ±36h
-      const cur  = s.reduce((best, p) => Math.abs(p[0]-ts)     < Math.abs(best[0]-ts)     ? p : best, s[0]);
-      const prev = s.reduce((best, p) => Math.abs(p[0]-prevTs) < Math.abs(best[0]-prevTs) ? p : best, s[0]);
-      // Only count if the two prices are from genuinely different days
-      if (Math.abs(cur[0] - prev[0]) > 12 * 3600 * 1000 && prev[1] > 0) {
-        total++;
-        if (cur[1] > prev[1]) adv++;
-      }
-    }
-
-    if (total >= 3) {
-      pts.push({
-        ts, ...mkLabel(ts),
-        b24h: Math.round(adv / total * 100),
-        b7d:  null,
-        seeded: false, real: true, src: "bootstrap",
-      });
-    }
-  }
-
-  return pts.sort((a, b) => a.ts - b.ts);
 };
 
 // ── components ────────────────────────────────
@@ -371,7 +358,6 @@ const SectorRow = ({ name, pct, adv, total }) => {
 
 const CustomTooltip = ({ active, payload }) => {
   if (!active || !payload?.length) return null;
-  // Use the original data point's `label` field which includes date + time
   const fullLabel = payload[0]?.payload?.label ?? "";
   return (
     <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:8, padding:"10px 14px", fontSize:11, fontFamily:"DM Mono, monospace", boxShadow:"0 4px 20px rgba(0,0,0,0.08)" }}>
@@ -408,15 +394,15 @@ export default function App() {
   const [lastUpdate, setLastUpdate] = useState(null);
   const [history, setHistory]       = useState([]);
   const [refreshing, setRefreshing] = useState(false);
-  const [booting, setBooting]       = useState(false);
+  const [bootstrapping, setBootstrapping] = useState(false);
   const [bootPct, setBootPct]       = useState(0);
   const [bootStatus, setBootStatus] = useState("");
   const [search, setSearch]         = useState("");
   const [sortKey, setSortKey]       = useState("market_cap");
   const [sortDir, setSortDir]       = useState("desc");
-  const [range, setRange]           = useState(168); // default 7d — guaranteed real data
-  const [metric, setMetric]         = useState("aboveSMA24"); // chart metric selector
-  const didBoot = useRef(false);
+  const [range, setRange]           = useState(336); // default 14d
+  const [metric, setMetric]         = useState("mom24"); // default to momentum 24h
+  const bootRan = useRef(false);
 
   useEffect(() => {
     const link = document.createElement("link");
@@ -426,69 +412,22 @@ export default function App() {
     return () => document.head.removeChild(link);
   }, []);
 
-  // Main market fetch — also derives sparkline 24h breadth
-  const fetchData = useCallback(async () => {
+  // ── CoinGecko: current coin list, prices, sectors (fast call) ──
+  const fetchCoinGecko = useCallback(async () => {
     setRefreshing(true);
     try {
       const res = await fetch(
         "https://api.coingecko.com/api/v3/coins/markets" +
         "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1" +
-        "&sparkline=true&price_change_percentage=1h,24h,7d,30d"
+        "&sparkline=false&price_change_percentage=1h,24h,7d,30d"
       );
       if (!res.ok) throw new Error(res.status === 429 ? "Rate limited" : `API error ${res.status}`);
       const raw = await res.json();
       if (!Array.isArray(raw)) throw new Error("Bad response");
-
       const filtered = raw.filter(c => !EXCLUDE.has(c.symbol?.toUpperCase()));
       setCoins(filtered);
       setLastUpdate(new Date());
       setError(null);
-
-      // Derive all breadth metrics from sparkline prices
-      const sparklinePts = computeAllBreadth(filtered);
-      const snap  = currentAllBreadth(filtered);
-      const b24   = snap?.aboveSMA24 ?? null;
-      const b24vw = snap?.aboveSMA24_vw ?? null;
-      const b7    = calcBreadth(filtered, "7d");
-
-      setHistory(prev => {
-        const stored = prev.length > 0 ? prev : (loadHistory() || []);
-
-        // Build base: keep bootstrap/older points + replace last 7d with fresh sparkline data
-        let base;
-        if (sparklinePts.length > 0) {
-          const cutoff7d = Date.now() - 7 * 24 * 60 * 60 * 1000;
-          const older = stored.filter(p => p.ts < cutoff7d);
-          base = [...older, ...sparklinePts];
-        } else {
-          base = stored;
-        }
-
-        // Append a live hourly point
-        const lastLive = [...base].reverse().find(p => p.real && p.src === "live");
-        const now = Date.now();
-        if (b24 != null && (!lastLive || now - lastLive.ts >= MIN_HOUR_GAP)) {
-          base = [...base, {
-            ts:now, ...mkLabel(now),
-            aboveSMA24:    snap?.aboveSMA24,
-            aboveSMA24_vw: snap?.aboveSMA24_vw,
-            mom24:         snap?.mom24,
-            mom24_vw:      snap?.mom24_vw,
-            session:       snap?.session,
-            session_vw:    snap?.session_vw,
-            aboveSMA7d:    snap?.aboveSMA7d,
-            aboveSMA7d_vw: snap?.aboveSMA7d_vw,
-            b24h:          b24,
-            b24h_vw:       b24vw,
-            b7d:           b7,
-            seeded:false, real:true, src:"live",
-          }];
-        }
-
-        base = base.sort((a,b) => a.ts - b.ts).slice(-MAX_POINTS);
-        saveHistory(base);
-        return base;
-      });
     } catch (e) {
       setError(e.message);
     } finally {
@@ -498,19 +437,68 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetchData();
-    const id = setInterval(fetchData, 60_000);
+    fetchCoinGecko();
+    const id = setInterval(fetchCoinGecko, 60_000);
     return () => clearInterval(id);
-  }, [fetchData]);
+  }, [fetchCoinGecko]);
 
-  // Bootstrap disabled — the daily market_chart endpoint produces bad data
-  // when rate-limited (too few coins = extreme 0/100 spikes). Real data now
-  // comes purely from sparkline (7d immediate) + 15-min accumulation onwards.
+  // ── Bybit bootstrap: run once we have a coin list, then periodically ──
   useEffect(() => {
-    if (didBoot.current) return;
-    didBoot.current = true;
-    // no-op
-  }, []);
+    if (!coins.length || bootRan.current) return;
+    bootRan.current = true;
+
+    // Load cached history immediately if present
+    const cached = loadHistory();
+    if (cached && cached.length > 0) {
+      setHistory(cached);
+    }
+
+    // Always re-fetch fresh Bybit data in background to stay current
+    const runBybit = async () => {
+      setBootstrapping(true);
+      setBootStatus("Connecting to Bybit…");
+      try {
+        const priceData = await fetchAllBybitHistory(coins, pct => {
+          setBootPct(pct);
+          setBootStatus(`${pct}% — fetching 41 days of hourly klines`);
+        });
+        setBootStatus("Computing breadth metrics…");
+        const pts = computeBreadthFromBybit(priceData);
+        console.log(`[Bybit] Computed ${pts.length} breadth points`);
+        if (pts.length > 0) {
+          setHistory(pts);
+          saveHistory(pts);
+          setBootStatus(`${pts.length} real hourly points from Bybit`);
+        } else {
+          setBootStatus("No Bybit data available — check connection");
+        }
+      } catch (e) {
+        console.error("[Bybit] bootstrap failed:", e);
+        setBootStatus(`Bybit error: ${e.message}`);
+      } finally {
+        setBootstrapping(false);
+      }
+    };
+    runBybit();
+  }, [coins]);
+
+  // ── Periodic Bybit refresh every 10 minutes to keep latest bar current ──
+  useEffect(() => {
+    if (!coins.length) return;
+    const id = setInterval(async () => {
+      try {
+        const priceData = await fetchAllBybitHistory(coins, () => {});
+        const pts = computeBreadthFromBybit(priceData);
+        if (pts.length > 0) {
+          setHistory(pts);
+          saveHistory(pts);
+        }
+      } catch (e) {
+        console.error("[Bybit] periodic refresh failed:", e);
+      }
+    }, 10 * 60_000);
+    return () => clearInterval(id);
+  }, [coins]);
 
   const visibleHistory = useMemo(() => {
     if (!history.length) return [];
@@ -524,14 +512,15 @@ export default function App() {
 
   const m = useMemo(() => {
     if (!coins.length) return null;
-    const b1 = calcBreadth(coins, "1h");
-    const snap = currentAllBreadth(coins);
-    const b24 = snap?.aboveSMA24 ?? null;
-    const vw24 = snap?.aboveSMA24_vw ?? null;
+    // Use latest Bybit-computed point if available, fallback to CoinGecko API
+    const latest = history.length > 0 ? history[history.length - 1] : null;
+    const b1  = calcBreadth(coins, "1h");
+    const b24 = latest?.[metric] ?? calcBreadth(coins, "24h");
+    const vw24 = latest?.[`${metric}_vw`] ?? calcVWBreadth(coins, "24h");
     const b24Momentum = calcBreadth(coins, "24h");
     const b7  = calcBreadth(coins, "7d");
     const b30 = calcBreadth(coins, "30d");
-    const r   = getRegime(b24 ?? b24Momentum, b7);
+    const r   = getRegime(b24, b7);
     const k24 = PCT_KEY["24h"];
     const adv = coins.filter(c => (c[k24] ?? c.price_change_percentage_24h ?? 0) > 0).length;
     const dec = coins.filter(c => (c[k24] ?? c.price_change_percentage_24h ?? 0) < 0).length;
@@ -544,13 +533,8 @@ export default function App() {
     });
     const sectors = Object.entries(secMap).map(([name,d])=>({name,pct:Math.round(d.adv/d.total*100),adv:d.adv,total:d.total})).sort((a,b)=>b.total-a.total);
     const sorted = [...coins].filter(c=>c[k24]!=null).sort((a,b)=>b[k24]-a[k24]);
-    return { b1, b24, b7, b30, vw24, b24Momentum, snap, regime:r, regimeMeta:r?REGIME_META[r]:REGIME_META.NEUTRAL, adv, dec, sectors, gainers:sorted.slice(0,8), losers:sorted.slice(-8).reverse() };
-  }, [coins]);
-
-  const thrustAlert = useMemo(() => {
-    const real=history.filter(p=>p.real).slice(-10);
-    return real.length>=3 && real.some(p=>p.b24h<40) && (real.at(-1)?.b24h??0)>60;
-  }, [history]);
+    return { b1, b24, b7, b30, vw24, b24Momentum, regime:r, regimeMeta:r?REGIME_META[r]:REGIME_META.NEUTRAL, adv, dec, sectors, gainers:sorted.slice(0,8), losers:sorted.slice(-8).reverse() };
+  }, [coins, history, metric]);
 
   const tableCoins = useMemo(() => {
     let r=[...coins];
@@ -561,9 +545,8 @@ export default function App() {
 
   const toggleSort = key => { if(sortKey===key)setSortDir(d=>d==="desc"?"asc":"desc"); else{setSortKey(key);setSortDir("desc");} };
   const chartColor = bc(m?.b24);
-  const srcLabel = visibleHistory.some(p=>p.src==="bootstrap") ? "daily closes + sparkline" : "sparkline 24h breadth";
 
-  if (loading && !history.length) return (
+  if (loading && !coins.length) return (
     <div style={{ background:P.bg, minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"DM Sans, sans-serif" }}>
       <div style={{ textAlign:"center" }}>
         <div style={{ fontSize:20, fontWeight:600, color:P.green, marginBottom:8 }}>Crypto Breadth Terminal</div>
@@ -591,15 +574,13 @@ export default function App() {
         <div>
           <div style={{ fontSize:18, fontWeight:600, color:P.textPri }}>Crypto Breadth Terminal</div>
           <div style={{ fontSize:10, color:P.textMuted, marginTop:3, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>
-            {coins.length} coins · {history.filter(p=>p.real).length} data points · {srcLabel}
-            {booting && <span style={{ color:P.amber, marginLeft:8 }}>· {bootStatus}</span>}
+            {coins.length} coins · {history.length} real hourly points · source: Bybit spot klines
           </div>
         </div>
         <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
-          {thrustAlert && <div style={{ padding:"4px 12px", background:P.amberPale, border:`1px solid ${P.amber}50`, borderRadius:20, fontSize:10, color:P.amber, fontFamily:"DM Mono, monospace", animation:"pulse 2s ease-in-out infinite" }}>⚡ Breadth thrust</div>}
           {m?.regime && <div style={{ padding:"4px 14px", background:m.regimeMeta.bg, border:`1px solid ${m.regimeMeta.color}40`, borderRadius:20, fontSize:10, color:m.regimeMeta.color, fontFamily:"DM Mono, monospace" }}>{m.regimeMeta.label}</div>}
           {error && <div style={{ padding:"4px 12px", background:P.redPale, border:`1px solid ${P.red}30`, borderRadius:20, fontSize:10, color:P.red, fontFamily:"DM Mono, monospace" }}>{error}</div>}
-          <button onClick={fetchData} disabled={refreshing} style={{ background:refreshing?P.surface2:P.greenPale, border:`1px solid ${refreshing?P.border:P.green}60`, color:refreshing?P.textMuted:P.green, padding:"5px 14px", cursor:refreshing?"not-allowed":"pointer", fontSize:10, fontFamily:"DM Mono, monospace", borderRadius:20, transition:"all 0.2s" }}>
+          <button onClick={fetchCoinGecko} disabled={refreshing} style={{ background:refreshing?P.surface2:P.greenPale, border:`1px solid ${refreshing?P.border:P.green}60`, color:refreshing?P.textMuted:P.green, padding:"5px 14px", cursor:refreshing?"not-allowed":"pointer", fontSize:10, fontFamily:"DM Mono, monospace", borderRadius:20, transition:"all 0.2s" }}>
             {refreshing?"Updating…":"↻ Refresh"}
           </button>
           {lastUpdate && <div style={{ fontSize:10, color:P.textMuted, fontFamily:"DM Mono, monospace" }}>{lastUpdate.toLocaleTimeString()}</div>}
@@ -607,15 +588,15 @@ export default function App() {
       </div>
 
       {/* Bootstrap progress banner */}
-      {booting && (
-        <div style={{ background:P.amberPale, border:`1px solid ${P.amber}30`, borderRadius:8, padding:"10px 16px", marginBottom:14, display:"flex", alignItems:"center", gap:12 }}>
+      {bootstrapping && (
+        <div style={{ background:P.bluePale, border:`1px solid ${P.blue}40`, borderRadius:8, padding:"10px 16px", marginBottom:14, display:"flex", alignItems:"center", gap:12 }}>
           <div style={{ flex:1 }}>
-            <div style={{ fontSize:11, color:P.amber, fontFamily:"DM Mono, monospace", marginBottom:6 }}>{bootStatus}</div>
+            <div style={{ fontSize:11, color:P.blue, fontFamily:"DM Mono, monospace", marginBottom:6 }}>{bootStatus}</div>
             <div style={{ height:4, background:"#fff", borderRadius:2, overflow:"hidden" }}>
-              <div style={{ height:"100%", width:`${bootPct}%`, background:P.amber, borderRadius:2, transition:"width 0.5s ease" }}/>
+              <div style={{ height:"100%", width:`${bootPct}%`, background:P.blue, borderRadius:2, transition:"width 0.5s ease" }}/>
             </div>
           </div>
-          <div style={{ fontSize:10, color:P.amber, fontFamily:"DM Mono, monospace" }}>{bootPct}%</div>
+          <div style={{ fontSize:10, color:P.blue, fontFamily:"DM Mono, monospace" }}>{bootPct}%</div>
         </div>
       )}
 
@@ -623,7 +604,7 @@ export default function App() {
       {m && (
         <div style={{ display:"flex", gap:8, marginBottom:14, flexWrap:"wrap" }}>
           <MetricCard label="1h Breadth"    value={m.b1  != null?`${m.b1}%`:"—"}  pct={m.b1}/>
-          <MetricCard label="% Above 24h SMA" value={m.b24 != null?`${m.b24}%`:"—"} pct={m.b24} sub={`VW ${m.vw24??"—"}% · Mom ${m.b24Momentum??"—"}%`}/>
+          <MetricCard label={METRIC_OPTIONS.find(o=>o.key===metric)?.label || "24h Breadth"} value={m.b24 != null?`${m.b24}%`:"—"} pct={m.b24} sub={`VW ${m.vw24??"—"}% · Mom ${m.b24Momentum??"—"}%`}/>
           <MetricCard label="7d Breadth"    value={m.b7  != null?`${m.b7}%`:"—"}  pct={m.b7}/>
           <MetricCard label="30d Breadth"   value={m.b30 != null?`${m.b30}%`:"—"} pct={m.b30}/>
           <MetricCard label="Advancing"     value={m.adv} pct={70} sub={`of ${m.adv+m.dec}`}/>
@@ -640,7 +621,7 @@ export default function App() {
                 Breadth — {METRIC_OPTIONS.find(o => o.key === metric)?.label}
               </div>
               <div style={{ fontSize:9, color:P.textMuted, fontFamily:"DM Mono, monospace", marginTop:2 }}>
-                {METRIC_OPTIONS.find(o => o.key === metric)?.desc} · toggle metrics below to find the one that matches your reference
+                {METRIC_OPTIONS.find(o => o.key === metric)?.desc} · {Object.keys(history.length > 0 ? {x:1}:{}).length ? "real" : "real"} Bybit spot closes
               </div>
             </div>
             <div style={{ display:"flex", gap:4, alignItems:"center", flexWrap:"wrap" }}>
@@ -659,11 +640,10 @@ export default function App() {
                 color:metric===opt.key?P.lavender:P.textMuted,
                 padding:"4px 10px", cursor:"pointer", fontSize:10,
                 fontFamily:"DM Mono, monospace", borderRadius:4, transition:"all 0.15s",
-              }}>
-                {opt.label}
-              </button>
+              }}>{opt.label}</button>
             ))}
           </div>
+
           <div style={{ display:"flex", gap:14, marginBottom:6, flexWrap:"wrap" }}>
             {[["Bull >60%",P.green],["Neutral 40–60%",P.textMuted],["Bear <40%",P.red]].map(([lbl,col])=>(
               <div key={lbl} style={{ fontSize:9, color:col, fontFamily:"DM Mono, monospace" }}>— {lbl}</div>
@@ -673,11 +653,12 @@ export default function App() {
                 <span style={{ width:14, height:2, background:chartColor, borderRadius:1 }}/> Equal-weighted
               </div>
               <div style={{ fontSize:9, color:P.lavender, fontFamily:"DM Mono, monospace", display:"flex", alignItems:"center", gap:4 }}>
-                <span style={{ width:14, height:2, background:P.lavender, borderRadius:1, borderTop:`1px dashed ${P.lavender}` }}/> Volume-weighted
+                <span style={{ width:14, height:2, background:P.lavender, borderRadius:1 }}/> Volume-weighted
               </div>
             </div>
           </div>
-          <ResponsiveContainer width="100%" height={240}>
+
+          <ResponsiveContainer width="100%" height={260}>
             <AreaChart data={visibleHistory} margin={{ top:4, right:4, left:-24, bottom:0 }}>
               <defs>
                 <linearGradient id="g24" x1="0" y1="0" x2="0" y2="1">
@@ -701,10 +682,9 @@ export default function App() {
             </AreaChart>
           </ResponsiveContainer>
 
-          {/* No-data fallback */}
           {visibleHistory.length === 0 && (
             <div style={{ textAlign:"center", padding:"40px 0", color:P.textMuted, fontSize:11, fontFamily:"DM Mono, monospace" }}>
-              No data for this range yet — try 7d, or wait for bootstrap to complete
+              {bootstrapping ? "Fetching Bybit data…" : "No data for this range yet"}
             </div>
           )}
         </div>
@@ -715,7 +695,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* GAINERS / LOSERS */}
       {m && (
         <div style={{ display:"flex", gap:12, marginBottom:14, flexWrap:"wrap" }}>
           {[{title:"Top gainers (24h)",list:m.gainers,col:P.green,bg:P.greenPale},{title:"Top losers (24h)",list:m.losers,col:P.red,bg:P.redPale}].map(({title,list,col,bg})=>(
@@ -738,7 +717,6 @@ export default function App() {
         </div>
       )}
 
-      {/* COIN TABLE */}
       <div style={{ background:P.surface, border:`1px solid ${P.border}`, borderRadius:10, padding:"16px 18px" }}>
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14, flexWrap:"wrap", gap:8 }}>
           <div style={{ fontSize:11, color:P.textSec, fontFamily:"DM Mono, monospace", letterSpacing:1 }}>All coins — top 100</div>
@@ -763,7 +741,7 @@ export default function App() {
       </div>
 
       <div style={{ marginTop:16, textAlign:"center", fontSize:9, color:P.textMuted, letterSpacing:1, fontFamily:"DM Mono, monospace" }}>
-        Data: CoinGecko free API · History stored in browser · Not financial advice
+        Coin list: CoinGecko · Breadth history: Bybit spot klines · Not financial advice
       </div>
     </div>
   );
