@@ -31,7 +31,7 @@ const P = {
 // ─────────────────────────────────────────────
 //  CONSTANTS
 // ─────────────────────────────────────────────
-const STORAGE_KEY   = "cbt_hourly_v2";
+const STORAGE_KEY   = "cbt_hourly_v3";
 const MIN_HOUR_GAP  = 50 * 60 * 1000; // 50 min in ms — one point per hour
 const MAX_POINTS    = 2160;            // 90 days × 24h
 
@@ -113,6 +113,8 @@ const buildSeed = (anchorB24) => {
     const noise  = (Math.random() - 0.5) * 6;
     const b24    = Math.max(8, Math.min(92, anchorB24 + macro + mid + short + noise));
     const b7     = Math.max(8, Math.min(92, anchorB24 + macro * 0.7 + mid * 0.5 + (Math.random() - 0.5) * 5));
+    const hf     = Math.sin(frac * Math.PI * 120) * 12 + Math.sin(frac * Math.PI * 300) * 8;
+    const b1     = Math.max(5, Math.min(95, anchorB24 + macro * 0.6 + mid * 1.2 + hf + (Math.random() - 0.5) * 18));
     const ts     = now - (total - i) * 60 * 60 * 1000;
     const d      = new Date(ts);
 
@@ -121,6 +123,7 @@ const buildSeed = (anchorB24) => {
       label: d.toLocaleDateString([], { month: "short", day: "numeric" }) +
              " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       dateLabel: d.toLocaleDateString([], { month: "short", day: "numeric" }),
+      b1h:   Math.round(b1),
       b24h:  Math.round(b24),
       b7d:   Math.round(b7),
       seeded: true,
@@ -349,6 +352,7 @@ export default function CryptoBreadthTerminal() {
 
       const b24 = calcBreadth(filtered, "24h");
       const b7  = calcBreadth(filtered, "7d");
+      const b1  = calcBreadth(filtered, "1h");
 
       setHistory(prev => {
         // Bootstrap from localStorage or seed if empty
@@ -370,6 +374,7 @@ export default function CryptoBreadthTerminal() {
             label: d.toLocaleDateString([], { month: "short", day: "numeric" }) +
                    " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
             dateLabel: d.toLocaleDateString([], { month: "short", day: "numeric" }),
+            b1h:   b1,
             b24h:  b24,
             b7d:   b7,
             seeded: false,
@@ -449,7 +454,7 @@ export default function CryptoBreadthTerminal() {
   const thrustAlert = useMemo(() => {
     const real = history.filter(p => !p.seeded).slice(-10);
     if (real.length < 3) return false;
-    return real.some(p => p.b24h < 40) && (real.at(-1)?.b24h ?? 0) > 60;
+    return real.some(p => p.b1h != null && p.b1h < 40) && (real.at(-1)?.b1h ?? 0) > 60;
   }, [history]);
 
   const tableCoins = useMemo(() => {
@@ -577,7 +582,7 @@ export default function CryptoBreadthTerminal() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
             <div>
               <div style={{ fontSize: 11, color: P.textSec, fontFamily: "DM Mono, monospace", letterSpacing: 1 }}>
-                24h breadth — hourly
+                1h breadth — hourly snapshots
               </div>
               {realPointCount < 24 && (
                 <div style={{ fontSize: 9, color: P.textMuted, fontFamily: "DM Mono, monospace", marginTop: 3 }}>
@@ -601,7 +606,7 @@ export default function CryptoBreadthTerminal() {
               ))}
               {/* Legend */}
               <div style={{ display: "flex", gap: 10, marginLeft: 8 }}>
-                {[["24h", chartColor], ["7d", P.blue]].map(([lbl, col]) => (
+                {[["1h", P.red], ["24h", chartColor], ["7d", P.blue]].map(([lbl, col]) => (
                   <div key={lbl} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 9, color: P.textMuted }}>
                     <div style={{ width: 14, height: 2, background: col, borderRadius: 1 }}/>
                     {lbl}
@@ -621,12 +626,16 @@ export default function CryptoBreadthTerminal() {
           <ResponsiveContainer width="100%" height={240}>
             <AreaChart data={visibleHistory} margin={{ top: 4, right: 4, left: -24, bottom: 0 }}>
               <defs>
+                <linearGradient id="g1h" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%"  stopColor={P.red}   stopOpacity={0.15}/>
+                  <stop offset="95%" stopColor={P.red}   stopOpacity={0}/>
+                </linearGradient>
                 <linearGradient id="g24" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor={chartColor} stopOpacity={0.2}/>
+                  <stop offset="5%"  stopColor={chartColor} stopOpacity={0.12}/>
                   <stop offset="95%" stopColor={chartColor} stopOpacity={0}/>
                 </linearGradient>
                 <linearGradient id="g7" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor={P.blue}  stopOpacity={0.1}/>
+                  <stop offset="5%"  stopColor={P.blue}  stopOpacity={0.08}/>
                   <stop offset="95%" stopColor={P.blue}  stopOpacity={0}/>
                 </linearGradient>
               </defs>
@@ -644,7 +653,8 @@ export default function CryptoBreadthTerminal() {
               <ReferenceLine y={50} stroke={`${P.textMuted}40`} strokeDasharray="2 4"/>
               <ReferenceLine y={40} stroke={`${P.red}55`}       strokeDasharray="4 4"/>
               <Area dataKey="b7d"  name="7d"  stroke={P.blue}      fill="url(#g7)"  strokeWidth={1}   dot={false} strokeDasharray="5 3" connectNulls/>
-              <Area dataKey="b24h" name="24h" stroke={chartColor}  fill="url(#g24)" strokeWidth={2}   dot={false} connectNulls/>
+              <Area dataKey="b24h" name="24h" stroke={chartColor}  fill="url(#g24)" strokeWidth={1.5} dot={false} connectNulls/>
+              <Area dataKey="b1h"  name="1h"  stroke={P.red}       fill="url(#g1h)" strokeWidth={2.5} dot={false} connectNulls/>
             </AreaChart>
           </ResponsiveContainer>
         </div>
