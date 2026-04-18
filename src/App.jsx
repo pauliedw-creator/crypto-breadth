@@ -15,9 +15,9 @@ const P = {
   lavender:"#8b7fba", teal:"#4a9e9e",
 };
 
-const STORAGE_KEY  = "cbt_v7";
-const MIN_HOUR_GAP = 50 * 60 * 1000;
-const MAX_POINTS   = 2160;
+const STORAGE_KEY  = "cbt_v8";
+const MIN_HOUR_GAP = 15 * 60 * 1000;  // 15 min — captures intraday oscillation
+const MAX_POINTS   = 8640;             // 90 days × 96 points/day (at 15 min intervals)
 
 const EXCLUDE = new Set([
   "USDT","USDC","BUSD","DAI","TUSD","USDP","GUSD","FRAX","LUSD","SUSD",
@@ -401,8 +401,10 @@ export default function App() {
     if (!history.length) return [];
     const cutoff = Date.now() - range * 60 * 60 * 1000;
     const pts = history.filter(p => p.ts >= cutoff && p.b24h != null);
-    if (pts.length <= 300) return pts;
-    const step = Math.ceil(pts.length / 300);
+    // For longer ranges thin to ~500 points so chart stays readable
+    const maxPts = range <= 168 ? pts.length : 500;
+    if (pts.length <= maxPts) return pts;
+    const step = Math.ceil(pts.length / maxPts);
     return pts.filter((_, i) => i % step === 0 || i === pts.length - 1);
   }, [history, range]);
 
