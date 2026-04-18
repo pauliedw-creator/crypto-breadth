@@ -31,7 +31,7 @@ const P = {
 // ─────────────────────────────────────────────
 //  CONSTANTS
 // ─────────────────────────────────────────────
-const STORAGE_KEY   = "cbt_hourly_v3";
+const STORAGE_KEY   = "cbt_hourly_v4";
 const MIN_HOUR_GAP  = 50 * 60 * 1000; // 50 min in ms — one point per hour
 const MAX_POINTS    = 2160;            // 90 days × 24h
 
@@ -100,22 +100,61 @@ const buildSeed = (anchorB24) => {
   const points = [];
   const total  = MAX_POINTS;
 
-  // Macro cycle: one full swing over 90 days
-  // Mid cycle: ~2 week rhythm
-  // Short cycle: ~3 day rhythm
-  // Noise
+  // Build a realistic regime path: string together bear → recovery → bull → pullback phases
+  // Each phase has a target centre and the line moves toward it with momentum
+  const phases = [
+    { centre: 22, len: 0.18 },  // bear phase — breadth crushed
+    { centre: 38, len: 0.10 },  // dead cat / choppy
+    { centre: 62, len: 0.15 },  // recovery
+    { centre: 80, len: 0.20 },  // bull phase — everything pumping
+    { centre: 68, len: 0.10 },  // mild pullback
+    { centre: 75, len: 0.12 },  // continuation
+    { centre: 35, len: 0.15 },  // correction
+  ];
+
+  // Pre-compute a smooth baseline by lerping through phase centres
+  const baseline = new Float32Array(total);
+  let phaseStart = 0;
+  for (const ph of phases) {
+    const phaseLen = Math.round(ph.len * total);
+    for (let j = 0; j < phaseLen && phaseStart + j < total; j++) {
+      baseline[phaseStart + j] = ph.centre;
+    }
+    phaseStart += phaseLen;
+  }
+  // Fill any remainder with anchorB24
+  for (let i = phaseStart; i < total; i++) baseline[i] = anchorB24;
+
+  // Smooth the baseline with a wide moving average so transitions are gradual
+  const smoothed = new Float32Array(total);
+  const win = 48; // 48h smoothing window
+  for (let i = 0; i < total; i++) {
+    let sum = 0, cnt = 0;
+    for (let j = Math.max(0, i - win); j <= Math.min(total - 1, i + win); j++) {
+      sum += baseline[j]; cnt++;
+    }
+    smoothed[i] = sum / cnt;
+  }
 
   for (let i = 0; i < total; i++) {
-    const frac   = i / total;
-    const macro  = Math.sin(frac * Math.PI * 1.6 - 0.4) * 22;
-    const mid    = Math.sin(frac * Math.PI * 13)  * 10;
-    const short  = Math.sin(frac * Math.PI * 40)  * 7;
-    const noise  = (Math.random() - 0.5) * 6;
-    const b24    = Math.max(8, Math.min(92, anchorB24 + macro + mid + short + noise));
-    const b7     = Math.max(8, Math.min(92, anchorB24 + macro * 0.7 + mid * 0.5 + (Math.random() - 0.5) * 5));
-    const hf     = Math.sin(frac * Math.PI * 120) * 12 + Math.sin(frac * Math.PI * 300) * 8;
-    const b1     = Math.max(5, Math.min(95, anchorB24 + macro * 0.6 + mid * 1.2 + hf + (Math.random() - 0.5) * 18));
-    const ts     = now - (total - i) * 60 * 60 * 1000;
+    const frac  = i / total;
+    const base  = smoothed[i];
+
+    // 1h: hero oscillator — rides the baseline but swings ±25 with 2-day + 6h rhythms
+    const mid2d = Math.sin(frac * Math.PI * 45)  * 14;
+    const hi6h  = Math.sin(frac * Math.PI * 180) * 9;
+    const noise1 = (Math.random() - 0.5) * 10;
+    const b1    = Math.max(5, Math.min(95, base + mid2d + hi6h + noise1));
+
+    // 24h: slower, follows baseline more closely
+    const mid7d  = Math.sin(frac * Math.PI * 13) * 8;
+    const noise24 = (Math.random() - 0.5) * 5;
+    const b24   = Math.max(8, Math.min(92, base + mid7d + noise24));
+
+    // 7d: smoothest, almost just the baseline
+    const b7    = Math.max(10, Math.min(90, base + (Math.random() - 0.5) * 4));
+
+    const ts    = now - (total - i) * 60 * 60 * 1000;
     const d      = new Date(ts);
 
     points.push({
