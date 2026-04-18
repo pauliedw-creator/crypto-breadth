@@ -31,7 +31,7 @@ const P = {
 // ─────────────────────────────────────────────
 //  CONSTANTS
 // ─────────────────────────────────────────────
-const STORAGE_KEY   = "cbt_hourly_v4";
+const STORAGE_KEY   = "cbt_hourly_v5";
 const MIN_HOUR_GAP  = 50 * 60 * 1000; // 50 min in ms — one point per hour
 const MAX_POINTS    = 2160;            // 90 days × 24h
 
@@ -92,42 +92,64 @@ const RANGE_OPTIONS = [
 ];
 
 // ─────────────────────────────────────────────
-//  SEED — 90 days of realistic hourly breadth
-//  Uses layered sine waves to simulate bull/bear cycles
+//  REAL HISTORY from sparkline (7 days, hourly closes per coin)
 // ─────────────────────────────────────────────
-const buildSeed = (anchorB24) => {
-  const now    = Date.now();
+const computeSparklineBreadth = (coins) => {
+  const sparklines = coins
+    .map(c => c.sparkline_in_7d?.price)
+    .filter(arr => Array.isArray(arr) && arr.length >= 48);
+
+  if (sparklines.length < 20) return [];
+
+  const len = Math.min(...sparklines.map(a => a.length));
+  const now = Date.now();
   const points = [];
-  const total  = MAX_POINTS;
 
-  // Build a realistic regime path: string together bear → recovery → bull → pullback phases
-  // Each phase has a target centre and the line moves toward it with momentum
-  const phases = [
-    { centre: 22, len: 0.18 },  // bear phase — breadth crushed
-    { centre: 38, len: 0.10 },  // dead cat / choppy
-    { centre: 62, len: 0.15 },  // recovery
-    { centre: 80, len: 0.20 },  // bull phase — everything pumping
-    { centre: 68, len: 0.10 },  // mild pullback
-    { centre: 75, len: 0.12 },  // continuation
-    { centre: 35, len: 0.15 },  // correction
-  ];
-
-  // Pre-compute a smooth baseline by lerping through phase centres
-  const baseline = new Float32Array(total);
-  let phaseStart = 0;
-  for (const ph of phases) {
-    const phaseLen = Math.round(ph.len * total);
-    for (let j = 0; j < phaseLen && phaseStart + j < total; j++) {
-      baseline[phaseStart + j] = ph.centre;
-    }
-    phaseStart += phaseLen;
+  for (let i = 1; i < len; i++) {
+    const adv1h  = sparklines.filter(arr => arr[i] > arr[i - 1]).length;
+    const b1h    = Math.round(adv1h / sparklines.length * 100);
+    const adv24h = i >= 24 ? sparklines.filter(arr => arr[i] > arr[i - 24]).length : null;
+    const b24h   = adv24h != null ? Math.round(adv24h / sparklines.length * 100) : null;
+    const ts     = now - (len - i) * 60 * 60 * 1000;
+    const d      = new Date(ts);
+    points.push({
+      ts,
+      label:     d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+                 d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      dateLabel: d.toLocaleDateString([], { month: 'short', day: 'numeric' }),
+      b1h, b24h, b7d: null, seeded: false, real: true,
+    });
   }
-  // Fill any remainder with anchorB24
-  for (let i = phaseStart; i < total; i++) baseline[i] = anchorB24;
+  return points;
+};
 
-  // Smooth the baseline with a wide moving average so transitions are gradual
+// ─────────────────────────────────────────────
+//  SYNTHETIC history for 30d/90d context
+//  Anchored to oldest real point so the join is smooth
+// ─────────────────────────────────────────────
+const buildSyntheticHistory = (anchorB1h, hoursBack) => {
+  const now    = Date.now();
+  const total  = hoursBack;
+  const phases = [
+    { centre: 18, len: 0.14 },
+    { centre: 32, len: 0.10 },
+    { centre: 68, len: 0.16 },
+    { centre: 86, len: 0.18 },
+    { centre: 60, len: 0.10 },
+    { centre: 80, len: 0.14 },
+    { centre: 28, len: 0.18 },
+  ];
+  const baseline = new Float32Array(total);
+  let pos = 0;
+  for (const ph of phases) {
+    const len = Math.round(ph.len * total);
+    for (let j = 0; j < len && pos + j < total; j++) baseline[pos + j] = ph.centre;
+    pos += len;
+  }
+  for (let i = pos; i < total; i++) baseline[i] = anchorB1h;
+
   const smoothed = new Float32Array(total);
-  const win = 48; // 48h smoothing window
+  const win = 72;
   for (let i = 0; i < total; i++) {
     let sum = 0, cnt = 0;
     for (let j = Math.max(0, i - win); j <= Math.min(total - 1, i + win); j++) {
@@ -135,37 +157,27 @@ const buildSeed = (anchorB24) => {
     }
     smoothed[i] = sum / cnt;
   }
+  // Ease the tail into anchorB1h so the join with real data is seamless
+  const tailLen = 72;
+  for (let i = total - tailLen; i < total; i++) {
+    const t = (i - (total - tailLen)) / tailLen;
+    smoothed[i] = smoothed[i] * (1 - t) + anchorB1h * t;
+  }
 
+  const points = [];
   for (let i = 0; i < total; i++) {
-    const frac  = i / total;
     const base  = smoothed[i];
-
-    // 1h: hero oscillator — rides the baseline but swings ±25 with 2-day + 6h rhythms
-    const mid2d = Math.sin(frac * Math.PI * 45)  * 14;
-    const hi6h  = Math.sin(frac * Math.PI * 180) * 9;
-    const noise1 = (Math.random() - 0.5) * 10;
-    const b1    = Math.max(5, Math.min(95, base + mid2d + hi6h + noise1));
-
-    // 24h: slower, follows baseline more closely
-    const mid7d  = Math.sin(frac * Math.PI * 13) * 8;
-    const noise24 = (Math.random() - 0.5) * 5;
-    const b24   = Math.max(8, Math.min(92, base + mid7d + noise24));
-
-    // 7d: smoothest, almost just the baseline
-    const b7    = Math.max(10, Math.min(90, base + (Math.random() - 0.5) * 4));
-
-    const ts    = now - (total - i) * 60 * 60 * 1000;
-    const d      = new Date(ts);
-
+    const frac  = i / total;
+    const b1    = Math.max(5,  Math.min(95, base + Math.sin(frac * Math.PI * 45) * 15 + Math.sin(frac * Math.PI * 180) * 9 + (Math.random() - 0.5) * 10));
+    const b24   = Math.max(8,  Math.min(92, base + (Math.random() - 0.5) * 6));
+    const ts    = now - (7 * 24 + total - i) * 60 * 60 * 1000;
+    const d     = new Date(ts);
     points.push({
       ts,
-      label: d.toLocaleDateString([], { month: "short", day: "numeric" }) +
-             " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      dateLabel: d.toLocaleDateString([], { month: "short", day: "numeric" }),
-      b1h:   Math.round(b1),
-      b24h:  Math.round(b24),
-      b7d:   Math.round(b7),
-      seeded: true,
+      label:     d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+                 d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      dateLabel: d.toLocaleDateString([], { month: 'short', day: 'numeric' }),
+      b1h: Math.round(b1), b24h: Math.round(b24), b7d: null, seeded: true, real: false,
     });
   }
   return points;
@@ -375,7 +387,7 @@ export default function CryptoBreadthTerminal() {
       const res = await fetch(
         "https://api.coingecko.com/api/v3/coins/markets" +
         "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1" +
-        "&sparkline=false&price_change_percentage=1h,24h,7d,30d"
+        "&sparkline=true&price_change_percentage=1h,24h,7d,30d"
       );
       if (!res.ok) {
         if (res.status === 429) throw new Error("Rate limited — retrying shortly");
@@ -394,15 +406,34 @@ export default function CryptoBreadthTerminal() {
       const b1  = calcBreadth(filtered, "1h");
 
       setHistory(prev => {
-        // Bootstrap from localStorage or seed if empty
-        let base = prev.length > 0 ? prev : (loadHistory() || []);
+        // Load from localStorage first
+        let stored = prev.length > 0 ? prev : (loadHistory() || []);
 
-        if (base.length === 0 && b24 != null) {
-          base = buildSeed(b24);
+        // Compute real 7-day hourly breadth from sparkline data
+        const realPts = computeSparklineBreadth(filtered);
+
+        // If we have real sparkline points, use them as the authoritative 7-day window
+        // Merge: keep synthetic history older than 7 days, replace last 7 days with real data
+        let base;
+        if (realPts.length > 0) {
+          const cutoff7d = Date.now() - 7 * 24 * 60 * 60 * 1000;
+          const oldSynthetic = stored.filter(p => p.ts < cutoff7d && p.seeded);
+
+          // Build synthetic pre-history if we don't have enough
+          if (oldSynthetic.length < 100) {
+            const anchorB1h = realPts[0]?.b1h ?? 50;
+            const synthetic = buildSyntheticHistory(anchorB1h, 83 * 24); // 83 days before the 7d window
+            base = [...synthetic, ...realPts];
+          } else {
+            base = [...oldSynthetic, ...realPts];
+          }
+        } else {
+          // Sparkline unavailable — fall back to stored or empty
+          base = stored.length > 0 ? stored : [];
         }
 
-        // Only append a real point if at least 50 min have passed
-        const lastReal = [...base].reverse().find(p => !p.seeded);
+        // Append current live point hourly
+        const lastReal = [...base].reverse().find(p => p.real);
         const now      = Date.now();
         const shouldAppend = !lastReal || (now - lastReal.ts) >= MIN_HOUR_GAP;
 
@@ -410,24 +441,16 @@ export default function CryptoBreadthTerminal() {
           const d     = new Date(now);
           const point = {
             ts: now,
-            label: d.toLocaleDateString([], { month: "short", day: "numeric" }) +
-                   " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+            label:     d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " +
+                       d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
             dateLabel: d.toLocaleDateString([], { month: "short", day: "numeric" }),
-            b1h:   b1,
-            b24h:  b24,
-            b7d:   b7,
-            seeded: false,
+            b1h: b1, b24h: b24, b7d: b7, seeded: false, real: true,
           };
-          const updated = [...base.slice(-MAX_POINTS + 1), point];
-          saveHistory(updated);
-          return updated;
+          base = [...base.slice(-MAX_POINTS + 1), point];
         }
 
-        if (base !== prev) {
-          saveHistory(base);
-          return base;
-        }
-        return prev;
+        saveHistory(base.filter(p => p.real)); // only persist real points
+        return base;
       });
     } catch (e) {
       setError(e.message);
@@ -623,11 +646,9 @@ export default function CryptoBreadthTerminal() {
               <div style={{ fontSize: 11, color: P.textSec, fontFamily: "DM Mono, monospace", letterSpacing: 1 }}>
                 1h breadth — hourly snapshots
               </div>
-              {realPointCount < 24 && (
-                <div style={{ fontSize: 9, color: P.textMuted, fontFamily: "DM Mono, monospace", marginTop: 3 }}>
-                  Seeded data shown · live history builds up over time (1 pt/hr)
-                </div>
-              )}
+              <div style={{ fontSize: 9, color: P.textMuted, fontFamily: "DM Mono, monospace", marginTop: 2 }}>
+                last 7d = real sparkline data · older = synthetic context
+              </div>
             </div>
 
             <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
