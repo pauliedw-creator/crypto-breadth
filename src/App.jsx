@@ -571,6 +571,12 @@ export default function App() {
     return withOverlay;
   }, [history, range]);
 
+  // Shared X domain for main chart + momentum histogram so they align vertically
+  const xDomain = useMemo(() => {
+    if (!visibleHistory.length) return [0, 1];
+    return [visibleHistory[0].ts, visibleHistory[visibleHistory.length - 1].ts];
+  }, [visibleHistory]);
+
   // Identify weekend ranges (Saturday 00:00 UTC → Monday 00:00 UTC) for shading
   const weekendRanges = useMemo(() => {
     if (!showWeekends || !visibleHistory.length) return [];
@@ -578,18 +584,14 @@ export default function App() {
     const lastTs  = visibleHistory[visibleHistory.length - 1].ts;
     const ranges = [];
 
-    // Walk from the first visible point's week backwards to find the Saturday 00:00 UTC
-    // that starts the earliest weekend to render
     const d0 = new Date(firstTs);
-    // Go back to the most recent Saturday at 00:00 UTC
-    const daysBack = (d0.getUTCDay() + 1) % 7; // Sat=6 → 0, Sun=0 → 1, Mon=1 → 2…
+    const daysBack = (d0.getUTCDay() + 1) % 7;
     const firstSat = Date.UTC(d0.getUTCFullYear(), d0.getUTCMonth(), d0.getUTCDate() - daysBack, 0, 0, 0);
 
     const WEEK = 7 * 24 * 60 * 60 * 1000;
     const WEEKEND = 2 * 24 * 60 * 60 * 1000;
     for (let sat = firstSat; sat <= lastTs + WEEK; sat += WEEK) {
       const sun_end = sat + WEEKEND;
-      // Clip to visible window
       const x1 = Math.max(sat, firstTs);
       const x2 = Math.min(sun_end, lastTs);
       if (x2 > x1) ranges.push({ x1, x2 });
@@ -971,7 +973,7 @@ export default function App() {
           </div>
 
           <ResponsiveContainer width="100%" height={280}>
-            <ComposedChart data={visibleHistory} margin={{ top:4, right:4, left:-24, bottom:0 }}>
+            <ComposedChart data={visibleHistory} margin={{ top:4, right:8, left:0, bottom:0 }}>
               <defs>
                 <linearGradient id="g24" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%"  stopColor={chartColor} stopOpacity={0.22}/>
@@ -983,7 +985,8 @@ export default function App() {
                 dataKey="ts"
                 type="number"
                 scale="time"
-                domain={["dataMin", "dataMax"]}
+                domain={xDomain}
+                allowDataOverflow={false}
                 tick={{ fontSize:8, fill:P.textMuted }}
                 tickLine={false}
                 axisLine={false}
@@ -995,7 +998,7 @@ export default function App() {
                 }}
                 minTickGap={50}
               />
-              <YAxis domain={[0,100]} tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} tickFormatter={v=>`${v}%`}/>
+              <YAxis domain={[0,100]} width={42} tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} tickFormatter={v=>`${v}%`}/>
               <Tooltip content={<CustomTooltip/>}/>
 
               {/* Weekend shading */}
@@ -1065,9 +1068,9 @@ export default function App() {
                 </div>
               </div>
               <ResponsiveContainer width="100%" height={70}>
-                <BarChart data={visibleHistory} margin={{ top:2, right:4, left:-24, bottom:0 }}>
-                  <XAxis dataKey="ts" type="number" scale="time" domain={["dataMin", "dataMax"]} hide/>
-                  <YAxis tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} width={32}/>
+                <BarChart data={visibleHistory} margin={{ top:2, right:8, left:0, bottom:0 }}>
+                  <XAxis dataKey="ts" type="number" scale="time" domain={xDomain} allowDataOverflow={false} hide/>
+                  <YAxis tick={{ fontSize:8, fill:P.textMuted }} tickLine={false} axisLine={false} width={42}/>
                   <ReferenceLine y={0} stroke={P.border}/>
                   <Tooltip
                     content={({ active, payload }) => {
