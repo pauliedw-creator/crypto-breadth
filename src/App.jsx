@@ -16,9 +16,12 @@ const P = {
   lavender:"#8b7fba", teal:"#4a9e9e",
 };
 
-const STORAGE_KEY  = "cbt_bybit_v3";
+const STORAGE_KEY       = "cbt_bybit_v3";
+const PRICE_STORAGE_KEY = "cbt_pricedata_v1";
 const MIN_HOUR_GAP = 15 * 60 * 1000;
 const MAX_POINTS   = 3000;
+const REFRESH_INTERVAL_MS = 5 * 60 * 1000;  // Bybit re-poll every 5 minutes
+const CACHE_FRESH_MS      = 7 * 60 * 1000;  // Cache considered fresh if updated within 7 min
 
 const EXCLUDE = new Set([
   "USDT","USDC","BUSD","DAI","TUSD","USDP","GUSD","FRAX","LUSD","SUSD",
@@ -134,6 +137,26 @@ const loadHistory = () => {
 const saveHistory = pts => {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(pts.slice(-MAX_POINTS))); }
   catch {}
+};
+const loadPriceData = () => {
+  try { const r = localStorage.getItem(PRICE_STORAGE_KEY); return r ? JSON.parse(r) : null; }
+  catch { return null; }
+};
+const savePriceData = pd => {
+  try {
+    // Store with timestamp of when it was saved
+    const wrapped = { savedAt: Date.now(), data: pd };
+    localStorage.setItem(PRICE_STORAGE_KEY, JSON.stringify(wrapped));
+  } catch {
+    // localStorage can throw on quota exceeded — that's fine, we'll re-fetch
+  }
+};
+// Returns true if the most recent data point is less than `maxAgeMs` old
+const isCacheFresh = (pts, maxAgeMs) => {
+  if (!pts || pts.length === 0) return false;
+  const latest = pts[pts.length - 1];
+  if (!latest?.ts) return false;
+  return (Date.now() - latest.ts) < maxAgeMs;
 };
 
 // ── BYBIT: fetch real exchange candles ────────────────────────────────
@@ -438,28 +461,50 @@ export default function App() {
     return () => clearInterval(id);
   }, [fetchCoinGecko]);
 
-  // ── Bybit bootstrap: run once we have a coin list, then periodically ──
+  // ── Bybit bootstrap: smart caching — skip re-fetch if data is fresh ──
   useEffect(() => {
     if (!coins.length || bootRan.current) return;
     bootRan.current = true;
 
-    // Load cached history immediately if present
-    const cached = loadHistory();
-    if (cached && cached.length > 0) {
-      setHistory(cached);
+    // Load cached history and priceData immediately
+    const cachedHistory = loadHistory();
+    const cachedPrice   = loadPriceData();
+
+    // Show cached data instantly if present
+    if (cachedHistory && cachedHistory.length > 0) {
+      setHistory(cachedHistory);
+    }
+    if (cachedPrice?.data) {
+      setPriceData(cachedPrice.data);
     }
 
-    // Always re-fetch fresh Bybit data in background to stay current
+    // Decide: do we need to re-bootstrap from Bybit, or is cache fresh enough?
+    const cacheAge = cachedPrice?.savedAt ? (Date.now() - cachedPrice.savedAt) : Infinity;
+    const cacheFresh = cacheAge < CACHE_FRESH_MS && cachedPrice?.data && Object.keys(cachedPrice.data).length >= 10;
+
+    if (cacheFresh) {
+      console.log(`[Bybit] Using cached data (age: ${Math.round(cacheAge / 1000)}s)`);
+      // Recompute breadth from cached priceData (in case sector filter differs)
+      const pts = computeBreadthFromBybit(cachedPrice.data, null);
+      if (pts.length > 0) {
+        setHistory(pts);
+        saveHistory(pts);
+      }
+      return;
+    }
+
+    // Cache is stale or missing — bootstrap from Bybit
     const runBybit = async () => {
       setBootstrapping(true);
-      setBootStatus("Connecting to Bybit…");
+      setBootStatus(cachedHistory?.length ? "Refreshing market data…" : "Connecting to Bybit…");
       try {
         const pd = await fetchAllBybitHistory(coins, pct => {
           setBootPct(pct);
           setBootStatus(`${pct}% — fetching 41 days of hourly klines`);
         });
         setBootStatus("Computing breadth metrics…");
-        setPriceData(pd); // store for recompute on sector change
+        setPriceData(pd);
+        savePriceData(pd);
         const pts = computeBreadthFromBybit(pd, null);
         console.log(`[Bybit] Computed ${pts.length} breadth points`);
         if (pts.length > 0) {
@@ -488,24 +533,35 @@ export default function App() {
     }
   }, [sectorFilter, priceData]);
 
-  // ── Periodic Bybit refresh every 10 minutes to keep latest bar current ──
+  // ── Periodic Bybit refresh to keep latest bar current ──
+  // Uses refs so the interval doesn't reset every time coins/sectorFilter change.
+  // Without this, the 1-minute CoinGecko refresh would reset the 5-min timer perpetually.
+  const coinsRef = useRef(coins);
+  const sectorFilterRef = useRef(sectorFilter);
+  useEffect(() => { coinsRef.current = coins; }, [coins]);
+  useEffect(() => { sectorFilterRef.current = sectorFilter; }, [sectorFilter]);
+
   useEffect(() => {
-    if (!coins.length) return;
     const id = setInterval(async () => {
+      const currentCoins = coinsRef.current;
+      if (!currentCoins.length) return;
       try {
-        const pd = await fetchAllBybitHistory(coins, () => {});
+        console.log("[Bybit] Periodic refresh starting…");
+        const pd = await fetchAllBybitHistory(currentCoins, () => {});
         setPriceData(pd);
-        const pts = computeBreadthFromBybit(pd, sectorFilter);
+        savePriceData(pd);
+        const pts = computeBreadthFromBybit(pd, sectorFilterRef.current);
         if (pts.length > 0) {
+          console.log(`[Bybit] Periodic refresh done: ${pts.length} points, latest ${new Date(pts[pts.length-1].ts).toLocaleTimeString()}`);
           setHistory(pts);
           saveHistory(pts);
         }
       } catch (e) {
         console.error("[Bybit] periodic refresh failed:", e);
       }
-    }, 10 * 60_000);
+    }, REFRESH_INTERVAL_MS);
     return () => clearInterval(id);
-  }, [coins, sectorFilter]);
+  }, []); // empty deps → set up once on mount, never reset
 
   const visibleHistory = useMemo(() => {
     if (!history.length) return [];
